@@ -116,6 +116,18 @@ def test_queue_overflow_is_reported_without_blocking(otel):
         uploader.close()
 
 
+def test_flush_timeout_does_not_claim_evaluations_were_submitted():
+    provider = SimpleNamespace(force_flush=lambda **kwargs: False)
+    uploader = EvaluationUploader(provider, client(lambda **kwargs: pytest.fail("Upload before span flush")),
+                                  space_id="space", project_name="scram")
+    try:
+        uploader.submit("0000000000000001", [])
+        assert uploader.flush(3)
+        assert uploader.status("0000000000000001") == "error:TimeoutError"
+    finally:
+        uploader.close()
+
+
 def test_span_export_error_does_not_block_rollback(engine, otel, monkeypatch):
     class BrokenTracer:
         def start_span(self, name, **kwargs):

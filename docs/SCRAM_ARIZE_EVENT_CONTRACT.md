@@ -61,6 +61,19 @@ Other integration PRs must preserve these calls when editing the engine:
   include the successful audit event.
 - Daytona: the executor context must wrap the remote call, including transport errors.
 
+At the reviewed branch heads, core fix PR #16 also changes `_evaluate`, `_finish`, and
+the execution boundary. Preserve its transaction locks and audit failure handling;
+record the audit outcome and evaluate the resulting terminal state before publishing
+the completed RunView. Record an expiry rejection at the final approval check.
+Its executor-timeout recovery can complete without a postcondition read; the rollback
+evaluator must retain INCOMPLETE until that path supplies sufficient observed evidence.
+Update the timeout regression to expect the corrected recovery behavior, while retaining
+the independent executor count and error event assertions.
+
+Daytona fix PR #17 adds sandbox cleanup to the FastAPI lifespan. Merge both cleanup paths:
+drain execution and close the sandbox, then close pending traces and drain AX uploads.
+README sponsor rows and requirement additions should be combined, keeping `arize==8.59.1`.
+
 The public RunView shape remains unchanged except for optional evaluator label, score,
 and explanation fields. Detailed events and export status are available at
 `GET /api/runs/{id}/evidence`.

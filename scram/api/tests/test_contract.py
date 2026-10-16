@@ -143,3 +143,17 @@ def test_baseline_and_health_shapes():
 def test_unknown_case_and_unknown_run_are_404():
     assert client.post("/api/runs", json={"case_id": "C9"}).status_code in (404, 422)
     assert client.get("/api/runs/run_nope").status_code == 404
+    assert client.get("/api/runs/run_nope/evidence").status_code == 404
+
+
+def test_evidence_endpoint_matches_run_and_survives_local_mode():
+    v = create("C3")
+    response = client.get(f"/api/runs/{v['run_id']}/evidence")
+    assert response.status_code == 200
+    result = response.json()
+    assert result["evaluators"] == v["evaluators"]
+    assert result["export_status"] == "local"
+    assert result["evidence"]["executor_call_count"] == 0
+    assert result["evidence"]["terminal_state"] == "BLOCKED"
+    assert [event["step"] for event in result["evidence"]["events"]] == [
+        "normalize", "rule.retrieve", "policy", "audit"]
