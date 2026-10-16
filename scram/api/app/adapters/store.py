@@ -56,8 +56,10 @@ class Store:
         return row
 
     def save_run(self, run_id: str, data: dict[str, Any]) -> None:
+        """Create the run, or merge fields into it. A plain upsert would replace the record and drop
+        action_hash and policy on the next state change."""
         with self._lock:
-            self.db.upsert(self.rid("run", run_id), data)
+            self.db.query("UPSERT $rid MERGE $data", {"rid": self.rid("run", run_id), "data": data})
 
     def link_rule(self, run_id: str, rule_id: str, policy: str, reason: str) -> None:
         with self._lock:
@@ -84,7 +86,8 @@ class Store:
 
     def rules_for_run(self, run_id: str) -> list[dict[str, Any]]:
         with self._lock:
-            res = self.db.query(f"SELECT ->governed_by->rule.* AS rules FROM run:{run_id}")
+            # Bound as a record, never interpolated: a run_id like "x; DELETE run" must stay data.
+            res = self.db.query("SELECT ->governed_by->rule.* AS rules FROM $run", {"run": self.rid("run", run_id)})
         try:
             rules = res[0]["rules"]
         except (IndexError, KeyError, TypeError):
@@ -92,8 +95,9 @@ class Store:
         return [{k: (str(v) if k == "id" else v) for k, v in r.items()} for r in rules if isinstance(r, dict)]
 
     def wipe_runs(self) -> None:
+        """Clears run state for a demo reset. The audit log is append-only and is never deleted."""
         with self._lock:
-            for t in ("run", "approval", "checkpoint", "audit", "governed_by"):
+            for t in ("run", "approval", "checkpoint", "governed_by"):
                 self.db.query(f"DELETE {t}")
 
 
