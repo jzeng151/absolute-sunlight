@@ -96,3 +96,21 @@ def test_surreal_graph_links_rule():
     v = client.post("/api/runs", json={"case_id": "C3"}).json()
     rules = client.get(f"/api/runs/{v['run_id']}/rules").json()
     assert rules and rules[0]["rule_id"] == "NC-04"
+
+
+def test_gemini_key_never_in_url(monkeypatch):
+    import httpx
+
+    from app.adapters import others
+
+    seen = {}
+
+    def fake_post(url, **kw):
+        seen.update(url=url, **kw)
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "secret-key")
+    monkeypatch.setattr(httpx, "post", fake_post)
+    assert others.parse_with_model("Increase output by 2%") is None
+    assert "secret-key" not in seen["url"] and "params" not in seen
+    assert seen["headers"]["x-goog-api-key"] == "secret-key"

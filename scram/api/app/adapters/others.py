@@ -31,7 +31,8 @@ def parse_with_model(text: str) -> dict[str, Any] | None:
             "contents": [{"parts": [{"text": _PROMPT + text}]}],
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
         }
-        r = httpx.post(url, params={"key": config.GEMINI_API_KEY}, json=body, timeout=20)
+        # Key goes in a header, never the URL: httpx errors print the URL into the logs.
+        r = httpx.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body, timeout=20)
         r.raise_for_status()
         raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(raw)
