@@ -6,6 +6,10 @@
 
 ---
 
+## Team name
+
+Absolute Sunlight
+
 ## Project name
 
 SCRAM
