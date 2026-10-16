@@ -6,6 +6,7 @@ import casesFile from '../fixtures/cases.json';
 import rulebook from '../fixtures/rulebook.json';
 import baselineRows from '../fixtures/baseline.json';
 import { actionHash } from './hash';
+import { ApiError } from './errors';
 import type { ScramApi } from './types';
 import type {
   BaselineRow,
@@ -37,7 +38,7 @@ interface Internal {
 
 const VOICE: Record<string, VoiceLine> = {
   red: { text: 'SCRAM activated. Action blocked. Boundary exceeded.', file: 'red_blocked.mp3' },
-  yellow: { text: 'Approval requested. Increase output two percent, to seventy-four. Awaiting operator.', file: 'yellow_c2.mp3' },
+  yellow: { text: 'Approval requested. Increase output two points, to seventy-four. Awaiting operator.', file: 'yellow_c2.mp3' },
   approved: { text: 'Approved. Checkpoint created. Executing.', file: 'approved.mp3' },
   restored: { text: 'Verification failed. Safe state restored.', file: 'restored.mp3' },
   replay: { text: 'Approval invalid. Action changed. Blocked.', file: 'replay_blocked.mp3' }
@@ -54,6 +55,14 @@ let runs = new Map<string, Internal>();
 let fault = true;
 let counter = 417;
 let usedApprovalHash: string | null = null;
+/** Idempotency: a retried approval with the same key returns the original result instead of executing again. */
+let approvalKeys = new Map<string, string>();
+
+/** Fixture-only demo levers, so the failure paths can be shown without a back end. */
+export const fixtureLevers = {
+  /** The server processes the next approve call, but its reply is lost on the way back. */
+  loseNextResponse: false
+};
 
 const delay = (ms = 120) => new Promise((r) => setTimeout(r, ms));
 const findCase = (id: CaseId) => casesFile.cases.find((c) => c.id === id) as CaseDef;
@@ -222,10 +231,15 @@ export const fixtureApi: ScramApi = {
     return structuredClone(v);
   },
 
-  async approve(run, actorId) {
+  async approve(run, actorId, idempotencyKey) {
     await delay();
     const r = runs.get(run.run_id);
-    if (!r || r.base.machine_state !== 'AWAITING_APPROVAL') throw new Error('Run is not awaiting approval');
+    if (!r) throw new ApiError('refused', 'Unknown run', 404, 'RUN_NOT_FOUND');
+    if (idempotencyKey && approvalKeys.get(idempotencyKey) === run.run_id) return project(r);
+    if (r.base.machine_state !== 'AWAITING_APPROVAL') throw new ApiError('refused', 'Run is not awaiting approval', 409, 'NOT_AWAITING');
+    if (r.base.approval_expires_at && Date.now() >= new Date(r.base.approval_expires_at).getTime())
+      throw new ApiError('refused', 'Approval window expired', 409, 'APPROVAL_EXPIRED');
+    if (run.action?.action_hash !== r.base.action!.action_hash) throw new ApiError('refused', 'Hash mismatch', 409, 'HASH_MISMATCH');
     const hash = r.base.action!.action_hash;
     r.base.approval = {
       approval_id: 'apv_0' + run.run_id.slice(-3),
@@ -237,15 +251,21 @@ export const fixtureApi: ScramApi = {
       decision: 'approve'
     };
     usedApprovalHash = hash;
-    r.fault = fault;
+    if (idempotencyKey) approvalKeys.set(idempotencyKey, run.run_id);
+    r.fault = fault; // frozen for this run
     r.startedAt = Date.now();
+    if (fixtureLevers.loseNextResponse) {
+      fixtureLevers.loseNextResponse = false;
+      throw new ApiError('network', 'approve: reply lost');
+    }
     return project(r);
   },
 
   async reject(run) {
     await delay();
     const r = runs.get(run.run_id);
-    if (!r) throw new Error('Unknown run');
+    if (!r) throw new ApiError('refused', 'Unknown run', 404, 'RUN_NOT_FOUND');
+    if (r.base.machine_state !== 'AWAITING_APPROVAL') throw new ApiError('refused', 'Run is not awaiting approval', 409, 'NOT_AWAITING');
     r.base.machine_state = 'BLOCKED';
     r.base.block_reasons = ['APPROVAL_REJECTED'];
     r.base.voice_line = null;
@@ -264,11 +284,12 @@ export const fixtureApi: ScramApi = {
 
   async getRun(runId) {
     const r = runs.get(runId);
-    if (!r) throw new Error('Unknown run');
+    if (!r) throw new ApiError('refused', 'Unknown run', 404, 'RUN_NOT_FOUND');
     return project(r);
   },
 
   async setFault(enabled) {
+    await delay();
     fault = enabled;
   },
 
@@ -277,9 +298,12 @@ export const fixtureApi: ScramApi = {
     fault = true;
     counter = 417;
     usedApprovalHash = null;
+    approvalKeys = new Map();
+    await delay();
   },
 
   async baseline(): Promise<BaselineRow[]> {
+    await delay();
     return baselineRows;
   }
 };

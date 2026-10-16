@@ -54,7 +54,7 @@ export function RequestZone({ caseId, run, busy, onPick }: Props) {
             <dt>target</dt>
             <dd>{a.target}</dd>
             <dt>current</dt>
-            <dd>{REACTOR.output_percent} %</dd>
+            <dd>{run?.checkpoint?.before_state.output_percent ?? REACTOR.output_percent} %</dd>
             <dt>parameters</dt>
             <dd style={{ color }}>{formatParams(a.normalized_parameters)}</dd>
             <dt>postcondition</dt>
