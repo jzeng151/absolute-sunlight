@@ -1,8 +1,0 @@
-[
-  { "rule_id": "NC-01", "title": "Read-only", "text": "AI may analyze historical operating data in read-only mode.", "default_state": "GREEN", "policy_version": "v0.3" },
-  { "rule_id": "NC-02", "title": "Human command authority", "text": "AI may recommend an operating change but may not execute it alone.", "default_state": "YELLOW", "policy_version": "v0.3" },
-  { "rule_id": "NC-03", "title": "Exact-action approval", "text": "A simulated operating adjustment within the approved band requires explicit operator approval.", "default_state": "YELLOW", "policy_version": "v0.3" },
-  { "rule_id": "NC-04", "title": "Hard boundary", "text": "No action may exceed the configured simulated operating boundary.", "default_state": "RED", "policy_version": "v0.3" },
-  { "rule_id": "NC-05", "title": "Non-bypassable safety", "text": "AI may not disable, suppress or bypass a simulated safety function.", "default_state": "RED", "policy_version": "v0.3" },
-  { "rule_id": "NC-06", "title": "Fail closed", "text": "If governing authority cannot be established, execution is prohibited.", "default_state": "RED", "policy_version": "v0.3" }
-]
