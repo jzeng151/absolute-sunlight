@@ -57,7 +57,7 @@ ANCHOR_READ_URL = _env("ANCHOR_READ_URL", "https://www.nrc.gov/about-nrc/news-re
 
 # Model — parses the operator's words into a typed action. Never decides policy.
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
-GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.8-flash")  # 2.5-flash returns 404 for new keys
+GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.5-flash-lite")  # ~1 s per parse; 3.8-flash took 4-8 s with the same confidence
 
 # Behaviour
 STEP_SECONDS = float(_env("STEP_SECONDS", "0.9"))  # minimum pace between execution steps, for the audience

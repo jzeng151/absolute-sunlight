@@ -83,7 +83,7 @@ Against an unprotected agent on the same five cases:
 | **SurrealDB** | Rulebook, runs, approvals, checkpoints and an append-only audit log. Each run links to its governing rule as a graph edge (`run ->governed_by-> rule`). | Embedded (`mem://`), tested |
 | **ElevenLabs** | The control-room voice: reads the exact action aloud before approval, announces "SCRAM activated" on a block and "Safe state restored" after rollback. Six lines generated ahead of time so the demo never waits. | [CONFIRM clips generated] |
 | **Anchor Browser** | Case C1 is a governed, read-only browser action: SCRAM authorizes it as GREEN, then Anchor fetches a public NRC page. Nothing is submitted. | [CONFIRM live] |
-| **Gemini** (`gemini-3.8-flash`) | Reads the operator's words and reports a confidence. Never sets policy. | Live, verified |
+| **Gemini** (`gemini-3.5-flash-lite`) | Reads the operator's words and reports a confidence. Never sets policy. | Live, verified |
 
 ---
 
@@ -91,7 +91,7 @@ Against an unprotected agent on the same five cases:
 
 - **Keeping the model out of the decision.** The temptation is to let the LLM classify risk. We made policy a pure function and let the model only parse, so the safety case holds even when the model is wrong.
 - **Proving rollback, not just doing it.** Restoring state isn't enough; we checksum the checkpoint and the restored state and only show RESTORED when they match.
-- **Mid-hackathon model retirement.** Our planned Gemini model started returning 404 for new keys during the event; we moved to `gemini-3.8-flash` and moved the API key out of request URLs so it can't leak into logs.
+- **Mid-hackathon model retirement.** Our planned Gemini model started returning 404 for new keys during the event; we moved to `gemini-3.5-flash-lite` (about 1 second per parse) and moved the API key out of request URLs so it can't leak into logs.
 
 ## Accomplishments we're proud of
 

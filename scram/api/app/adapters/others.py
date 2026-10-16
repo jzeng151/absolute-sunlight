@@ -32,7 +32,7 @@ def parse_with_model(text: str) -> dict[str, Any] | None:
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
         }
         # Key goes in a header, never the URL: httpx errors print the URL into the logs.
-        r = httpx.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body, timeout=20)
+        r = httpx.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body, timeout=5)  # a slow network falls back to the prepared action, never stalls the demo
         r.raise_for_status()
         raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
         return json.loads(raw)
