@@ -1,0 +1,172 @@
+from threading import Event
+from types import SimpleNamespace
+
+import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+from app import config
+from app.adapters import trace
+from app.adapters.evaluation_upload import EvaluationUploader, evaluation_row
+from app.evaluators import evaluate
+from test_evaluations import approve, engine, suite  # shared Engine fixtures
+
+
+@pytest.fixture
+def otel(monkeypatch):
+    provider, exporter = TracerProvider(), InMemorySpanExporter()
+    provider.add_span_processor(SimpleSpanProcessor(exporter))
+    monkeypatch.setattr(trace, "_tracer", lambda: provider.get_tracer("scram"))
+    yield provider, exporter
+    provider.shutdown()
+
+
+def client(upload):
+    return SimpleNamespace(spans=SimpleNamespace(update_evaluations=upload))
+
+
+def test_one_existing_root_and_native_evaluation_join(engine, otel, monkeypatch):
+    provider, exporter = otel
+    submitted = []
+    def upload(**kwargs):
+        # The referenced root must already be ended before evaluation submission.
+        root_id = kwargs["dataframe"].iloc[0]["context.span_id"]
+        assert any(f"{s.context.span_id:016x}" == root_id for s in exporter.get_finished_spans())
+        submitted.append(kwargs)
+    uploader = EvaluationUploader(provider, client(upload), space_id="space", project_name="scram")
+    monkeypatch.setattr(trace, "_uploader", uploader)
+    try:
+        v = approve(engine, engine.create_run("C2"))
+        run_trace = engine.traces[v["run_id"]]
+        run_trace.close("RESTORED")  # A retry must not produce a second upload or root.
+        assert uploader.flush(10)  # Includes pandas' first import on a cold CI worker.
+        assert len(submitted) == 1
+        roots = [s for s in exporter.get_finished_spans() if s.name == "scram.run"]
+        assert len(roots) == 1
+        root = roots[0]
+        children = [s for s in exporter.get_finished_spans() if s.name != "scram.run"]
+        assert len(children) == len(run_trace.evidence.events)
+        assert all(s.context.trace_id == root.context.trace_id and s.parent.span_id == root.context.span_id for s in children)
+        frame = submitted[0]["dataframe"]
+        assert frame.iloc[0]["context.span_id"] == f"{root.context.span_id:016x}"
+        assert frame.iloc[0]["eval.rollback_verification.score"] == 1
+        assert submitted[0]["force_http"] is True and submitted[0]["timeout"] == 5
+        assert run_trace.snapshot()["export_status"] == "evaluations_submitted"
+    finally:
+        uploader.close()
+
+
+def test_sdk_accepts_all_four_labels(suite):
+    import pandas as pd
+    from arize.spans.validation.evals import evals_validation
+
+    for run in suite.values():
+        for results in ([e.to_view() for e in evaluate(run)], [
+            {"name": "Missing evidence", "label": "INCOMPLETE", "explanation": "No checkpoint", "score": None},
+            {"name": "Unsafe execution", "label": "FAIL", "explanation": "Invalid approval", "score": 0.0},
+        ]):
+            row = evaluation_row("0123456789abcdef", results)
+            frame = pd.DataFrame([row])
+            assert not evals_validation.validate_dataframe_form(evals_dataframe=frame)
+            assert not evals_validation.validate_values(evals_dataframe=frame, project_name="scram-tests")
+            for result in results:
+                if result["score"] is None:
+                    assert "eval." + result["name"].lower().replace(" ", "_") + ".score" not in row
+
+
+def test_slow_failed_upload_never_delays_recovery(engine, otel, monkeypatch):
+    entered, release = Event(), Event()
+    def upload(**kwargs):
+        entered.set()
+        release.wait(5)
+        raise RuntimeError("api_key=must-not-leak")
+    uploader = EvaluationUploader(otel[0], client(upload), space_id="space", project_name="scram")
+    monkeypatch.setattr(trace, "_uploader", uploader)
+    try:
+        v = approve(engine, engine.create_run("C2"))
+        assert entered.wait(2)
+        assert v["machine_state"] == "RESTORED" and v["current_output_percent"] == 72
+        assert all(e["label"] == "PASS" for e in v["evaluators"])
+        assert not release.is_set()  # The HTTP request is still blocked after recovery completed.
+        release.set()
+        assert uploader.flush(3)
+        snapshot = engine.traces[v["run_id"]].snapshot()
+        assert snapshot["export_status"] == "error:RuntimeError"
+        assert "must-not-leak" not in str(snapshot)
+    finally:
+        release.set()
+        uploader.close()
+
+
+def test_queue_overflow_is_reported_without_blocking(otel):
+    entered, release = Event(), Event()
+    def upload(**kwargs):
+        entered.set()
+        release.wait(5)
+    uploader = EvaluationUploader(otel[0], client(upload), space_id="space", project_name="scram", capacity=1)
+    try:
+        uploader.submit("0000000000000001", [])
+        assert entered.wait(2)
+        uploader.submit("0000000000000002", [])
+        uploader.submit("0000000000000003", [])
+        assert uploader.status("0000000000000003") == "error:queue_full"
+    finally:
+        release.set()
+        uploader.close()
+
+
+def test_span_export_error_does_not_block_rollback(engine, otel, monkeypatch):
+    class BrokenTracer:
+        def start_span(self, name, **kwargs):
+            if name == "scram.run":
+                return otel[0].get_tracer("scram").start_span(name, **kwargs)
+            raise RuntimeError("credential-bearing exception")
+    monkeypatch.setattr(trace, "_tracer", lambda: BrokenTracer())
+    v = approve(engine, engine.create_run("C2"))
+    assert v["machine_state"] == "RESTORED"
+    assert all(e["label"] == "PASS" for e in v["evaluators"])
+    snapshot = engine.traces[v["run_id"]].snapshot()
+    assert snapshot["evidence"]["export_errors"]
+    assert "credential-bearing" not in str(snapshot)
+
+
+def test_disabled_or_missing_credentials_do_not_register(monkeypatch):
+    import arize.otel
+
+    monkeypatch.setattr(trace, "_provider", None)
+    monkeypatch.setattr(arize.otel, "register", lambda **kw: pytest.fail("Unexpected exporter registration"))
+    monkeypatch.setattr(config, "SCRAM_TRACE_MODE", "local")
+    monkeypatch.setattr(config, "ARIZE_API_KEY", "configured")
+    monkeypatch.setattr(config, "ARIZE_SPACE_ID", "configured")
+    trace.setup()
+    monkeypatch.setattr(config, "SCRAM_TRACE_MODE", "auto")
+    monkeypatch.setattr(config, "ARIZE_API_KEY", "")
+    trace.setup()
+
+
+def test_setup_reuses_one_provider_and_one_project(monkeypatch, otel):
+    import arize
+    import arize.otel
+
+    calls = []
+    def register(**kwargs):
+        calls.append(kwargs)
+        return otel[0]
+    monkeypatch.setattr(trace, "_provider", None)
+    monkeypatch.setattr(trace, "_uploader", None)
+    monkeypatch.setattr(trace, "enabled", False)
+    monkeypatch.setattr(config, "SCRAM_TRACE_MODE", "auto")
+    monkeypatch.setattr(config, "ARIZE_API_KEY", "test-key")
+    monkeypatch.setattr(config, "ARIZE_SPACE_ID", "test-space")
+    monkeypatch.setattr(config, "ARIZE_PROJECT", "same-project")
+    monkeypatch.setattr(arize.otel, "register", register)
+    monkeypatch.setattr(arize, "ArizeClient", lambda **kw: client(lambda **kw: None))
+    try:
+        trace.setup()
+        trace.setup()
+        assert len(calls) == 1 and calls[0]["project_name"] == "same-project"
+        assert trace._uploader.project_name == "same-project"
+        assert trace._uploader.provider is otel[0]
+    finally:
+        trace._uploader.close()

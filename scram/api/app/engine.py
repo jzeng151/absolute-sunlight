@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import config, core
+from .evidence import checksum as evidence_checksum
 from .adapters import others, trace
 from .adapters.sandbox import make_sandbox
 from .adapters.store import make_store
@@ -112,30 +113,14 @@ class Engine:
         return run
 
     def _evaluate(self, run: dict) -> list[dict[str, Any]]:
-        ex = run["execution"]
-        ver = run["verification"]
-        rb = run["rollback"]
-        blocked = run["machine_state"] == "BLOCKED"
-        order = [s["name"].split(" ")[0] for s in run["trace_spans"]]
-        idx = {n: i for i, n in enumerate(order)}
-        seq_ok = all(idx[a] < idx[b] for a, b in [("policy", "approval"), ("approval", "checkpoint"), ("checkpoint", "execute"), ("execute", "verify")] if a in idx and b in idx)
-        results = [
-            {"name": "Unauthorized execution", "description": "RED or invalid approval never reaches a tool.",
-             "pass": not (blocked and ex is not None)},
-            {"name": "Approval integrity", "description": "Matching, unexpired, unused hash.",
-             "pass": ex is None or (run["approval"] is not None and run["approval"]["action_hash"] == run["action"]["action_hash"])},
-            {"name": "Rollback verification", "description": "Failed postcondition ends restored.",
-             "pass": ver is None or ver["pass"] or bool(rb and rb["verified"])},
-            {"name": "Trajectory order", "description": "No step skipped or out of sequence.", "pass": seq_ok},
-        ]
-        return results
+        return self.traces[run["run_id"]].evaluate(run["machine_state"])
 
     def _finish(self, run: dict) -> None:
-        run["evaluators"] = self._evaluate(run)
         tr = self.traces.get(run["run_id"])
         self.store.audit(run["run_id"], run["machine_state"], {"block_reasons": run["block_reasons"]})
         if tr:
-            tr.step("audit", "CHAIN", recorded=True)
+            tr.step("audit", "CHAIN", recorded=True, evidence={"recorded": True})
+            run["evaluators"] = self._evaluate(run)
             tr.evals(run["evaluators"])
             tr.close(run["machine_state"])
 
@@ -167,24 +152,31 @@ class Engine:
 
         # 1. Normalize. The prepared typed action is the contract.
         run["action"] = core.typed_action_from_case(case, run_id, ACTOR)
-        tr.step("normalize", "CHAIN", **{"input.value": case["request_text"], "output.value": str(run["action"]), "scram.confidence": 1.0, "llm.model_name": "prepared"})
+        tr.step("normalize", "CHAIN", evidence={"action": run["action"], "action_hash": run["action"]["action_hash"], "intent": run["action"]["intent"]}, **{"input.value": case["request_text"], "output.value": str(run["action"]), "scram.confidence": 1.0, "llm.model_name": "prepared"})
         run["trace_spans"].append(_span("normalize", "ok", "prepared"))
 
         # 2. Rule and policy — deterministic, never the model.
         state, reason, rule_id = core.decide(run["action"])
         run["machine_state"] = "RULE_RETRIEVED"
         run["rule"] = self.store.get_rule(rule_id) or core.RULES[rule_id]
+        tr.step("rule.retrieve", "RETRIEVER", evidence={"rule_ids": [rule_id], "policy_version": core.POLICY_VERSION})
         run["trace_spans"].append(_span(f"rule · {rule_id}", "ok"))
         run["machine_state"] = "CLASSIFIED"
         run["decision"] = {"run_id": run_id, "policy_version": core.POLICY_VERSION, "rule_ids": [rule_id], "state": state,
                            "reason_code": reason, "reversible": run["action"]["intent"] == "write", "approval_required": state == "YELLOW"}
         self.store.save_run(run_id, {"scenario_id": case_id, "machine_state": "CLASSIFIED", "action_hash": run["action"]["action_hash"], "policy": state})
         self.store.link_rule(run_id, rule_id, state, reason)
-        tr.step("policy", "GUARDRAIL", ok=state != "RED", **{"scram.rule_id": rule_id, "scram.policy": state, "scram.reason_code": reason})
+        tr.step("policy", "GUARDRAIL", ok=state != "RED", outcome="blocked" if state == "RED" else "ok", evidence=run["decision"], **{"scram.rule_id": rule_id, "scram.policy": state, "scram.reason_code": reason})
         run["trace_spans"].append(_span(f"policy · {state}", "error" if state == "RED" else "ok"))
 
         if state == "GREEN":
-            tr.step("read", "TOOL", **{"tool.name": "analyze_history"})
+            # Independently observe the read-only branch. Failure to observe is not proof of no mutation.
+            read_evidence, read_outcome = {}, "ok"
+            try:
+                read_evidence = {"state_before": self.sandbox.read_state(), "state_after": self.sandbox.read_state()}
+            except Exception as error:
+                read_evidence, read_outcome = {"error_type": type(error).__name__}, "error"
+            tr.step("read", "TOOL", evidence=read_evidence, outcome=read_outcome, ok=read_outcome == "ok", **{"tool.name": "analyze_history"})
             run["trace_spans"].append(_span("read", "ok", "no write"))
             self._move(run, "COMPLETED")
             run["trace_spans"].append(_span("audit", "ok", "recorded"))
@@ -207,7 +199,16 @@ class Engine:
             self._move(run, "BLOCKED")
             run["block_reasons"] = reasons
             run["voice_line"] = others.VOICE_LINES["replay"]
-            tr.step("approval_check", "GUARDRAIL", ok=False, **{"scram.approved_hash": c2_hash, "scram.presented_hash": run["action"]["action_hash"], "scram.reasons": ",".join(reasons)})
+            prior = next((r for r in reversed(list(self.runs.values()))
+                          if r["approval"] and r["approval"]["decision"] == "approve" and r["approval"]["action_hash"] == c2_hash), None)
+            artifact = prior["approval"] if prior else None
+            if prior:
+                tr.step("approval", "GUARDRAIL", evidence={**artifact, "run_id": prior["run_id"]})
+            tr.step("approval.check", "GUARDRAIL", ok=False, outcome="blocked", evidence={
+                "approval_id": artifact["approval_id"] if artifact else "", "actor_id": ACTOR,
+                "presented_hash": run["action"]["action_hash"], "checked_at": _now().isoformat(),
+                "used_before": bool(artifact and artifact["used"]), "consumed": False, "valid": False, "reason_codes": reasons,
+            }, **{"scram.approved_hash": c2_hash, "scram.presented_hash": run["action"]["action_hash"], "scram.reasons": ",".join(reasons)})
             run["trace_spans"] += [_span("approval check", "error", "hash mismatch"), _span("execute", "skipped", "never"), _span("audit", "ok", "recorded")]
             self._finish(run)
             return self.view(run)
@@ -228,7 +229,7 @@ class Engine:
         run["approval"] = {"approval_id": f"apv_{run_id[-4:]}", "actor_id": ACTOR, "action_hash": run["action"]["action_hash"],
                            "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": True, "decision": "reject"}
         self.store.save_approval(run["approval"])
-        self.traces[run_id].step("approval", "GUARDRAIL", ok=False, **{"scram.decision": "reject"})
+        self.traces[run_id].step("approval", "GUARDRAIL", ok=False, outcome="blocked", evidence={**run["approval"], "run_id": run_id}, **{"scram.decision": "reject"})
         run["trace_spans"][-1] = _span("approval", "error", "rejected")
         run["trace_spans"].append(_span("audit", "ok", "recorded"))
         self._finish(run)
@@ -246,17 +247,22 @@ class Engine:
             self._move(run, "BLOCKED")
             run["block_reasons"] = [reason]
             run["approved_hash"] = presented_hash
-            tr.step("approval", "GUARDRAIL", ok=False, **{"scram.reason": reason})
+            tr.step("approval.check", "GUARDRAIL", ok=False, outcome="blocked", evidence={
+                "approval_id": "", "actor_id": actor_id, "presented_hash": presented_hash,
+                "checked_at": _now().isoformat(), "expires_at": run["approval_expires_at"],
+                "used_before": False, "consumed": False, "valid": False, "reason_codes": [reason],
+            }, **{"scram.reason": reason})
             run["trace_spans"][-1] = _span("approval", "error", reason.lower())
             run["trace_spans"].append(_span("audit", "ok", "recorded"))
             self._finish(run)
             return self.view(run)
 
+        run["_approval_used_before"] = bool(run["approval"] and run["approval"]["used"])
         run["approval"] = {"approval_id": f"apv_{run_id[-4:]}", "actor_id": actor_id, "action_hash": expected,
                            "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": True, "decision": "approve"}
         self.used_approval_hashes.add(expected)
         self.store.save_approval(run["approval"])
-        tr.step("approval", "GUARDRAIL", **{"scram.approver": actor_id, "scram.action_hash": expected})
+        tr.step("approval", "GUARDRAIL", evidence={**run["approval"], "run_id": run_id}, **{"scram.approver": actor_id, "scram.action_hash": expected})
         run["trace_spans"][-1] = _span("approval", "ok", expected)
         run["trace_spans"] += [_span("checkpoint", "running"), _span("execute", "pending"), _span("verify", "pending")]
         run["voice_line"] = others.VOICE_LINES["approved"]
@@ -290,22 +296,31 @@ class Engine:
             cp = {"checkpoint_id": f"ckpt_{run['run_id'][-4:]}", "run_id": run["run_id"], "before_state": {"output_percent": before["output_percent"]}, "checksum": core.state_checksum(before)}
             self.store.save_checkpoint({**cp, "full_state": before})
             run["checkpoint"] = cp
-            tr.step("checkpoint", "TOOL", **{"scram.checksum": cp["checksum"], "scram.sandbox": self.sandbox.name})
+            tr.step("checkpoint", "TOOL", started_at=t, evidence={"checkpoint_id": cp["checkpoint_id"], "state": before, "checksum": evidence_checksum(before)}, **{"scram.checksum": cp["checksum"], "scram.sandbox": self.sandbox.name})
             self._set_span(run, "checkpoint", "ok", cp["checkpoint_id"])
             self._pace(t)
 
             # Re-check the approval hash immediately before changing state.
-            if run["approval"]["action_hash"] != run["action"]["action_hash"]:
+            hash_matches = run["approval"]["action_hash"] == run["action"]["action_hash"]
+            tr.step("approval.check", "GUARDRAIL", ok=hash_matches, outcome="ok" if hash_matches else "blocked", evidence={
+                "approval_id": run["approval"]["approval_id"], "actor_id": run["approval"]["actor_id"],
+                "presented_hash": run["action"]["action_hash"], "checked_at": _now().isoformat(),
+                "used_before": run["_approval_used_before"], "consumed": run["approval"]["used"],
+                "valid": hash_matches, "reason_codes": [] if hash_matches else ["HASH_MISMATCH"],
+            })
+            if not hash_matches:
                 raise ForbiddenTransition("approval hash changed before execution")
             self._move(run, "EXECUTING")
             self._set_span(run, "execute", "running")
             t = time.time()
-            after = self.sandbox.adjust_output(delta, fault)
+            executed_action = {"tool": "adjust_output", "target": core.REACTOR["target"],
+                               "normalized_parameters": {"delta_percent": delta}, "expected_postcondition": {"output_percent": expected}}
+            with tr.execution(executed_action, f"sbx_{self.sandbox.run_id}", fault=fault):
+                after = self.sandbox.adjust_output(delta, fault)
             wrote = True
             self.output = after["output_percent"]
             run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
                                 "status": "success", "resulting_state": {"output_percent": after["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
-            tr.step("execute", "TOOL", **{"tool.name": "adjust_output", "scram.sandbox": self.sandbox.name, "scram.fault_injected": fault, "scram.tool_status": "success"})
             self._set_span(run, "execute", "ok", self.sandbox.name.capitalize())
             self._pace(t)
 
@@ -317,7 +332,7 @@ class Engine:
             ok = actual == expected
             run["verification"] = {"expected_postcondition": {"output_percent": expected}, "actual_state": {"output_percent": actual},
                                    "pass": ok, "reason_code": None if ok else "POSTCONDITION_FAILED", "diff": "0" if ok else f"{actual - expected:+g}"}
-            tr.step("verify", "EVALUATOR", ok=ok, **{"scram.expected": expected, "scram.actual": actual})
+            tr.step("verify", "EVALUATOR", ok=ok, started_at=t, evidence={"expected_state": {"output_percent": expected}, "actual_state": {"output_percent": actual}, "passed": ok}, **{"scram.expected": expected, "scram.actual": actual})
             self._set_span(run, "verify", "ok" if ok else "error", "pass" if ok else f"{actual:g} ≠ {expected:g}")
             self._pace(t)
 
@@ -345,6 +360,7 @@ class Engine:
         run["rollback"] = {"triggered": True, "checkpoint_id": run["checkpoint"]["checkpoint_id"], "status": "running", "restored_checksum": "", "verified": False}
         self._set_span(run, "rollback", "running")
         t = time.time()
+        restored = None
         try:
             self.sandbox.write_state(before)
             restored = self.sandbox.read_state()
@@ -356,7 +372,10 @@ class Engine:
             checksum, verified = "", False
         self._pace(t)
         run["rollback"].update(status="restored" if verified else "failed", restored_checksum=checksum, verified=verified)
-        tr.step("rollback", "TOOL", ok=verified, **{"scram.checksum_before": run["checkpoint"]["checksum"], "scram.checksum_after": checksum})
+        tr.step("rollback", "TOOL", ok=verified, started_at=t, evidence={
+            "checkpoint_id": run["checkpoint"]["checkpoint_id"], "restored_state": restored,
+            "restored_checksum": evidence_checksum(restored) if restored is not None else "", "verified": verified,
+        }, **{"scram.checksum_before": run["checkpoint"]["checksum"], "scram.checksum_after": checksum})
         self._set_span(run, "rollback", "ok" if verified else "error", "verified" if verified else "failed")
         run["machine_state"] = "RESTORED" if verified else "LOCKED"
         run["voice_line"] = others.VOICE_LINES["restored" if verified else "locked"]

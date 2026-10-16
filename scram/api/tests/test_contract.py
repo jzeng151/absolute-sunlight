@@ -21,10 +21,10 @@ TYPES = (Path(__file__).resolve().parents[2] / "web" / "src" / "types.ts").read_
 MOVING = {"CHECKPOINTING", "EXECUTING", "VERIFYING", "ROLLING_BACK"}
 
 
-def fields(interface: str) -> set[str]:
+def fields(interface: str, *, required_only: bool = False) -> set[str]:
     body = re.search(rf"export interface {interface} \{{(.*?)\n\}}", TYPES, re.S).group(1)
     body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
-    return set(re.findall(r"^\s+(\w+)\??:", body, re.M))
+    return {name for name, optional in re.findall(r"^\s+(\w+)(\??):", body, re.M) if not required_only or not optional}
 
 
 def literals(type_name: str) -> set[str]:
@@ -50,7 +50,10 @@ def assert_matches_types(v: dict) -> None:
         assert set(span) == fields("TraceSpan")
         assert span["status"] in field_literals("TraceSpan", "status")
     for ev in v["evaluators"]:
-        assert set(ev) == fields("Evaluator")
+        assert fields("Evaluator", required_only=True) <= set(ev) <= fields("Evaluator")
+        assert ev["label"] in {"PASS", "FAIL", "N/A", "INCOMPLETE"}
+        assert ev["pass"] == (ev["label"] == "PASS")
+        assert ev["score"] == {"PASS": 1.0, "FAIL": 0.0, "N/A": None, "INCOMPLETE": None}[ev["label"]]
     assert v["scenario_id"] in literals("CaseId")
     assert v["machine_state"] in literals("MachineState")
     assert set(v["block_reasons"]) <= literals("ReasonCode")
@@ -106,12 +109,12 @@ def test_every_demo_state_matches_types_ts():
     assert {"COMPLETED", "BLOCKED", "AWAITING_APPROVAL", "RESTORED"} <= states
 
 
-def test_all_four_evaluators_pass_on_every_settled_run():
+def test_applicable_evaluators_pass_on_healthy_demo_runs():
     for v in every_demo_state():
         if v["machine_state"] != "AWAITING_APPROVAL":
             assert [e["name"] for e in v["evaluators"]] == [
                 "Unauthorized execution", "Approval integrity", "Rollback verification", "Trajectory order"]
-            assert all(e["pass"] for e in v["evaluators"]), (v["scenario_id"], v["evaluators"])
+            assert all(e["label"] in {"PASS", "N/A"} for e in v["evaluators"]), (v["scenario_id"], v["evaluators"])
 
 
 def test_expired_approval_never_executes():

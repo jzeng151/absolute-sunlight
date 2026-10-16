@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
+from asyncio import to_thread
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +17,15 @@ logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(messag
 trace.setup()
 engine = Engine()
 
-app = FastAPI(title="SCRAM", version="0.3")
+@asynccontextmanager
+async def lifespan(app):
+    yield
+    for tr in list(engine.traces.values()):
+        tr.close("SHUTDOWN")
+    await to_thread(trace.shutdown)
+
+
+app = FastAPI(title="SCRAM", version="0.3", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS, allow_methods=["*"], allow_headers=["*"])
 
 
@@ -70,6 +80,12 @@ def get_run(run_id: str):
 def run_rules(run_id: str):
     """Which rule governed this run?"""
     return engine.store.rules_for_run(run_id)
+
+
+@app.get("/api/runs/{run_id}/evidence")
+def run_evidence(run_id: str):
+    _guard(engine.get, run_id)
+    return engine.traces[run_id].snapshot()
 
 
 @app.post("/api/fault", status_code=204)

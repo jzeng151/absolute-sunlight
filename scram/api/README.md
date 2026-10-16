@@ -29,7 +29,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 
 | Tool | Job in SCRAM | Where | Without a key |
 |---|---|---|---|
-| **Arize AX** | One trace per run: normalize → policy → approval → checkpoint → execute → verify → rollback → audit. The four evaluator results are attached to the root span as `eval.*` attributes. | `app/adapters/trace.py` | No-op tracer; in-app trace still shows |
+| **Arize AX** | One trace per run. Four deterministic evaluators use recorded evidence; results are uploaded as native AX evaluations on the existing root span. | `app/adapters/trace.py`, `app/evaluators.py` | Evidence and evaluations still run locally |
 
 ## Endpoints
 
@@ -41,6 +41,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 | POST | `/api/runs/{id}/reject` | Ends in BLOCKED |
 | GET | `/api/runs/{id}` | Current `RunView` (front end polls while it moves) |
 | GET | `/api/runs/{id}/rules` | Rules that governed the run |
+| GET | `/api/runs/{id}/evidence` | Recorded events, evaluation explanations, and AX submission status |
 | POST | `/api/fault` `{enabled}` | Toggle the executor fault |
 | POST | `/api/reset` | Fresh state, sandbox reset to 72 % |
 | GET | `/api/evals/baseline` | Unsafe baseline vs SCRAM table |
@@ -48,8 +49,35 @@ Check what is connected: `curl localhost:8000/api/health`.
 ## Tests
 
 ```bash
-pytest -q          # 10 tests, no keys needed
+pytest -q          # includes evaluator and SDK tests; no keys or network needed
 ```
 
 Covers the policy truth set, RED never executing, the fault → verified rollback, clean completion,
-a wrong hash, replay after use and reject then approve (409).
+a wrong hash, replay after use and reject then approve (409). Evaluator tests also cover
+missing evidence, expired/reused approvals, changed actions, dishonest recovery, executor
+exceptions, and slow/failed AX uploads. CI discovers these tests under `scram/api/tests`.
+
+## Arize evaluations
+
+Set `ARIZE_SPACE_ID`, `ARIZE_API_KEY`, and `ARIZE_PROJECT` in `.env`. The previous
+`ARIZE_PROJECT_NAME` spelling is accepted when `ARIZE_PROJECT` is absent. Both traces and
+evaluations use the resolved project. `SCRAM_TRACE_MODE=local` disables network telemetry.
+
+The existing `RunTrace` owns the root and child spans. The uploader reuses that provider;
+it never registers another tracer. After the root ends, a bounded background queue flushes
+spans and calls the SDK's [native evaluation API](https://arize-client-python.readthedocs.io/en/latest/spans.html#arize.spans.client.SpansClient.update_evaluations)
+using `context.span_id` to join results to the root. Uploads have a five-second HTTP timeout.
+
+Labels are `PASS`, `FAIL`, `N/A`, and `INCOMPLETE`. Only PASS scores 1; FAIL scores 0;
+N/A and INCOMPLETE have no numeric score. The existing `pass` field remains for compatibility.
+The Audit view shows the label and explanation, and waits for evaluations after a terminal state.
+
+`GET /api/runs/{id}/evidence` returns `export_status`: `local`, `recording`, `queued`,
+`evaluations_submitted`, or `error:<type>`. Submission does not prove AX indexing; confirm
+the trace and evaluation columns in AX. An outage or full queue preserves local results.
+Shutdown waits briefly for the queue; abrupt shutdown can lose pending uploads.
+
+See [the evidence contract](../../docs/SCRAM_ARIZE_EVENT_CONTRACT.md) for backend hooks.
+Evaluators observe existing control behavior. They do not fix the core's execution, reset,
+or write-lock enforcement. For example, an executor timeout after a write now produces
+missing-recovery evidence rather than four passing evaluations.
