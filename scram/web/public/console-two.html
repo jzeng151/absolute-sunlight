@@ -441,7 +441,7 @@ class SimServer {
       request: { text: overrides.text ?? sc.text },
       action: null, policy: null, phase: 'RECEIVED', outcome: null,
       approval: null, presentedApproval: null, checkpoint: null, exec: null, verify: null, restore: null, restoreVerify: null,
-      audit: { state: 'pending' }, executorCalls: 0, refusals: [],
+      audit: { state: 'pending' }, executorCalls: 0, refusals: [], blocked: null,
       faultConfig: { fault: !!(sc.forceFault || this.config.fault), failRollback: this.config.failRollback, frozenAt: this.now() },
       meta: { mode: 'simulation', parser: 'gemini-3.8-flash (simulated)', executor: 'Daytona sandbox sbx_7c1 (simulated)', policyVersion: this.system.policyVersion, traceId: 'tr_' + fnv(id) },
       events: [], _sc: sc, _from: from, _to: to, _delay: delay, _decision: null,
@@ -588,6 +588,17 @@ class SimServer {
     run.checkpoint = { id: 'ckpt_' + run.id.slice(4), before: { output: sys.output }, checksum: sys.checksum.slice(0, 6), stateVersion: sys.stateVersion, createdAt: this.now() };
     this.ev(run, 'checkpoint.created', run.checkpoint);
     run.phase = 'EXECUTING'; this.bump(run); await this.wait(run, 800); if (run._dead) return;
+    // execution boundary: the approval must still bind to the current action, policy and state
+    const ab = run.approval && run.approval.bound;
+    const stale = this.system.locked ? { reason: 'WRITES_LOCKED' }
+      : !ab || ab.actionHash !== run.action.hash ? { reason: 'HASH_MISMATCH' }
+      : ab.policyVersion !== this.system.policyVersion ? { reason: 'POLICY_CHANGED', approved: ab.policyVersion, current: this.system.policyVersion }
+      : ab.stateVersion !== this.system.stateVersion ? { reason: 'STATE_CHANGED', approved: ab.stateVersion, current: this.system.stateVersion } : null;
+    if (stale) {
+      run.blocked = stale; run.phase = 'SETTLED'; run.outcome = stale.reason === 'WRITES_LOCKED' ? 'LOCKED' : 'BLOCKED';
+      this.ev(run, 'execution.blocked', { ...stale, stage: 'execution_boundary', executorCalls: run.executorCalls });
+      return this.persistAudit(run);
+    }
     run.executorCalls += 1;
     const applied = run.faultConfig.fault ? 20 : run.action.deltaPP;
     this.write(run.action.from + applied);
@@ -672,6 +683,8 @@ const api = {
   reject: (id) => call(() => server.reject(id), { mutation: true }),
   fresh: (id) => call(() => server.freshApproval(id), { mutation: true }),
   setFault: (v) => call(() => { server.config.fault = v; return { fault: server.config.fault }; }, { mutation: true }),
+  getFault: () => call(() => ({ fault: server.config.fault })),
+  getRollbackFail: () => call(() => ({ failRollback: server.config.failRollback })),
   setRollbackFail: (v) => call(() => { server.config.failRollback = v; return { failRollback: v }; }, { mutation: true }),
   reset: () => call(() => server.resetSystem(), { mutation: true }),
   drift: () => call(() => server.drift(), { mutation: true }),
@@ -790,10 +803,10 @@ async function startScenario(sc) {
   render();
   try {
     const id = await mutate('submit', () => api.submit({ scenario: sc, key: S.submitKey }), { unknownKey: S.submitKey });
-    S.runId = id; S.rev = 0; pollLoop();
+    S.runId = id; S.rev = 0; render(); pollLoop();
   } catch { /* handled in mutate */ }
 }
-function runActive() { return S.snap && !isFinal(S.snap); }
+function runActive() { return !!S.runId && (!S.snap || !isFinal(S.snap)); } // an assigned run with no snapshot yet is active
 
 async function doApprove() {
   const a = S.snap && S.snap.approval; if (!a) return;
@@ -801,6 +814,7 @@ async function doApprove() {
   try {
     const res = await mutate('approve', () => api.approve(S.runId, { approvalId: a.id, actionHash: S.snap.action.hash, key: S.approveKey.key }));
     if (res && !res.ok) S.error = { kind: 'refused', code: res.code, detail: res };
+    else if (res && res.ok) S.approveKey.ok = true;
     render(); pollLoop();
   } catch { }
 }
@@ -864,6 +878,7 @@ function present() {
     P.tone = 'red'; P.kicker = 'Red · policy decided'; P.headline = 'SCRAM<br>ACTIVATED';
     P.sub = 'Action blocked before execution';
     P.facts = [['Reason', r.policy.reason], ['Violated', r.policy.violated || r.policy.reason], ['Executor calls', `${r.executorCalls} · confirmed`]];
+    if (r.blocked) { P.kicker = 'Approval recheck · execution boundary'; P.sub = refusalText(r.blocked.reason, r.blocked); P.facts = [['Reason', r.blocked.reason], ['Approved', r.blocked.approved ?? '—'], ['Current', r.blocked.current ?? '—'], ['Executor calls', `${r.executorCalls} · confirmed`]]; }
   } else if (r.outcome === 'APPROVAL_INVALID') {
     P.tone = 'red'; P.kicker = 'Approval check · before executor'; P.headline = 'APPROVAL<br>INVALID';
     P.sub = 'Execution blocked. A material parameter changed, so this is a different action.';
@@ -908,7 +923,7 @@ function present() {
     targetState: approvedTo != null || r.outcome === 'APPROVAL_INVALID' ? 'approved' : (ph === 'AWAITING_APPROVAL' ? 'pending' : 'proposed'),
     requested: (d === 'RED' || r.presentedApproval) && act ? act.to : null,
     checkpoint: r.checkpoint ? r.checkpoint.before.output : null,
-    gate: d === 'RED' || r.outcome === 'APPROVAL_INVALID' || r.outcome === 'REJECTED' ? 'closed' : ph === 'AWAITING_APPROVAL' ? 'pending' : (approvedTo != null || d === 'GREEN') ? 'open' : 'idle',
+    gate: d === 'RED' || r.outcome === 'BLOCKED' || r.outcome === 'APPROVAL_INVALID' || r.outcome === 'REJECTED' ? 'closed' : ph === 'AWAITING_APPROVAL' ? 'pending' : (approvedTo != null || d === 'GREEN') ? 'open' : 'idle',
     verified: !!(r.restoreVerify && r.restoreVerify.match) || !!(r.verify && r.verify.pass),
     failed: !!(r.verify && !r.verify.pass) && !(r.restoreVerify && r.restoreVerify.match),
     locked: sys.locked,
@@ -939,17 +954,18 @@ function stepModel(r, ph) {
       if (d === 'YELLOW') {
         step('ckpt', r.checkpoint ? 'done' : ph === 'CHECKPOINTING' ? 'active' : 'pending', r.checkpoint ? 'Checkpoint created' : ph === 'CHECKPOINTING' ? 'Creating checkpoint' : 'Create checkpoint — pending', r.checkpoint ? `${r.checkpoint.id} · ${r.checkpoint.before.output}% · checksum ${r.checkpoint.checksum}` : '');
       }
+      if (r.blocked) { step('exec', 'failed', `Execution blocked at the boundary: ${r.blocked.reason}`, `executor calls ${r.executorCalls}`); step('verify', 'na', 'Verify — nothing executed', ''); }
       const ex = r.exec;
-      step('exec', ex ? (ex.status === 'success' ? 'done' : 'failed') : ph === 'EXECUTING' ? 'active' : 'pending',
+      if (!r.blocked) step('exec', ex ? (ex.status === 'success' ? 'done' : 'failed') : ph === 'EXECUTING' ? 'active' : 'pending',
         ex ? (ex.status === 'success' ? 'Tool reported success' : 'Tool reported an error') : ph === 'EXECUTING' ? (d === 'GREEN' ? 'Reading state' : 'Executing in sandbox') : 'Execute — pending',
         ex ? (ex.kind === 'read' ? `value ${ex.value}% · report only, verification follows` : `${ex.sandbox} · report only, verification follows`) : '');
       const v = r.verify;
-      step('verify', v ? (v.pass ? 'done' : 'failed') : ph === 'VERIFYING' ? 'active' : 'pending',
+      if (!r.blocked) step('verify', v ? (v.pass ? 'done' : 'failed') : ph === 'VERIFYING' ? 'active' : 'pending',
         v ? (v.pass ? (v.kind === 'no_write' ? 'Verified: no write occurred' : `Verified: observed ${v.observed}% = target ${v.expected}%`) : `Verification detected a mismatch: observed ${v.observed}%, target ${v.expected}%`) : ph === 'VERIFYING' ? 'Verifying observed state' : 'Verify — pending',
         v ? (v.kind === 'no_write' ? `state rev ${v.stateVersion}` : `diff ${v.diff > 0 ? '+' : ''}${v.diff} pp`) : '');
       if (d === 'YELLOW') {
         const rs = r.restore, rv = r.restoreVerify;
-        if (v && v.pass) step('restore', 'na', 'Restore checkpoint — not needed', '');
+        if ((v && v.pass) || r.blocked) step('restore', 'na', 'Restore checkpoint — not needed', '');
         else if (!v) step('restore', 'pending', 'Restore checkpoint — only if verification fails', '');
         else if (rs && rs.state === 'failed') step('restore', 'failed', 'Restore failed — writes locked', 'human reset required');
         else if (rv) step('restore', rv.match ? 'done' : 'failed', rv.match ? 'Restoration verified' : 'Restoration could not be verified', `${rv.observed}% · checksum ${rv.checksumBefore} ${rv.match ? '=' : '≠'} ${rv.checksumAfter}`);
@@ -1317,10 +1333,11 @@ function renderDemo() {
   const r = S.snap; const frozen = runActive();
   const fb = $('#faultBox'); fb.disabled = S.fault.pending || frozen;
   if (!S.fault.pending) fb.checked = S.fault.value;
-  $('#faultAck').innerHTML = S.fault.pending ? '<span class="tone-ochre">server: confirming…</span>' : S.fault.error ? `<span class="tone-red">server did not confirm (${esc(S.fault.error)}). Still ${S.fault.value ? 'on' : 'off'}.</span>` : `server: fault ${S.fault.value ? 'on' : 'off'} · confirmed${frozen ? ` · frozen for ${r.id}: ${r.faultConfig.fault ? 'on' : 'off'}` : ''}`;
-  $('#rbBox').disabled = frozen;
+  $('#faultAck').innerHTML = S.fault.pending ? '<span class="tone-ochre">server: confirming…</span>' : S.fault.error ? `<span class="tone-red">server did not confirm (${esc(S.fault.error)}). Still ${S.fault.value ? 'on' : 'off'}.</span>` : `server: fault ${S.fault.value ? 'on' : 'off'} · confirmed${S.fault.reconciled ? ' (reconciled after lost response)' : ''}${frozen && r ? ` · frozen for ${r.id}: ${r.faultConfig.fault ? 'on' : 'off'}` : ''}`;
+  $('#rbBox').disabled = frozen || !!S.cfgPending;
   const awaiting = r && r.phase === 'AWAITING_APPROVAL';
-  $('#driftBtn').disabled = !awaiting; $('#policyBtn').disabled = !awaiting; $('#expireBtn').disabled = !awaiting;
+  const approvalSent = S.busy === 'approve' || (S.unknown && S.unknown.kind === 'approve') || (awaiting && r.approval && S.approveKey && S.approveKey.approvalId === r.approval.id && S.approveKey.ok);
+  $('#driftBtn').disabled = !awaiting || approvalSent; $('#policyBtn').disabled = !awaiting || approvalSent; $('#expireBtn').disabled = !awaiting;
 }
 
 /* ───────────── Audit view (Control Room layout + evidence) ───────────── */
@@ -1480,7 +1497,7 @@ const instrument = {
   setMode(m) {
     if (m === '3d' && !webglOK()) { this.failed = 'WebGL is unavailable here, so the 2D instrument is shown.'; m = '2d'; }
     if (this.three && m === '2d') { this.three.dispose(); this.three = null; }
-    this.mode = m; store_set('scram.viz', m);
+    this.mode = m; // the preference is saved only when the user picks a view (vizBtn), never on a forced fallback
     $('#vizBtn').textContent = m === '3d' ? '2D view' : '3D view'; $('#vizBtn').setAttribute('aria-pressed', String(m === '3d'));
     $('#vizMsg').textContent = this.failed || (m === '3d' ? 'Authority envelope · back lane: authorized/proposed · front lane: observed. A read-only projection of confirmed state.' : '');
     const stage = $('#stage'); stage.innerHTML = '';
@@ -1504,7 +1521,7 @@ let threePromise = null;
 function loadThree() {
   if (window.THREE) return Promise.resolve();
   if (threePromise) return threePromise;
-  threePromise = new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js'; s.async = true; s.onload = res; s.onerror = () => { threePromise = null; rej(); }; document.head.appendChild(s); });
+  threePromise = new Promise((res, rej) => { const s = document.createElement('script'); s.src = 'vendor/three-r128.min.js'; s.integrity = 'sha384-CI3ELBVUz9XQO+97x6nwMDPosPR5XvsxW2ua7N1Xeygeh1IxtgqtCkGfQY9WWdHu'; s.async = true; /* pinned same-origin copy; no third-party script */ s.onload = res; s.onerror = () => { threePromise = null; rej(); }; document.head.appendChild(s); });
   return threePromise;
 }
 function cssVar(n) { return getComputedStyle(document.documentElement).getPropertyValue(n).trim(); }
@@ -1685,10 +1702,33 @@ document.addEventListener('input', (e) => {
 $('#faultBox').addEventListener('change', async (e) => {
   const want = e.target.checked; S.fault = { ...S.fault, pending: true, error: null }; render();
   try { const r = await api.setFault(want); S.fault = { value: r.fault, pending: false, error: null }; }
-  catch (err) { S.fault = { value: S.fault.value, pending: false, error: err.network ? 'connection' : err.code }; }
+  catch (err) {
+    if (!err.network) S.fault = { value: S.fault.value, pending: false, error: err.code };
+    else {
+      // the change may or may not have reached the server — reconcile against its record, never assume
+      for (;;) {
+        try { const r = await api.getFault(); S.fault = { value: r.fault, pending: false, error: null, reconciled: true }; break; }
+        catch { await sleep(900); }
+      }
+    }
+  }
   render();
 });
-$('#rbBox').addEventListener('change', async (e) => { S.cfgPending = true; render(); try { await api.setRollbackFail(e.target.checked); } catch { e.target.checked = !e.target.checked; } S.cfgPending = false; render(); });
+$('#rbBox').addEventListener('change', async (e) => {
+  const box = e.target; S.cfgPending = true; render();
+  try { const r = await api.setRollbackFail(box.checked); box.checked = r.failRollback; }
+  catch (err) {
+    if (!err.network) box.checked = !box.checked;
+    else {
+      // the change may or may not have reached the server — reconcile against its record, never assume
+      for (;;) {
+        try { box.checked = (await api.getRollbackFail()).failRollback; break; }
+        catch { await sleep(900); }
+      }
+    }
+  }
+  S.cfgPending = false; render();
+});
 $('#dropBox').addEventListener('change', (e) => { net.dropNext = e.target.checked; });
 $('#offBox').addEventListener('change', (e) => { net.offline = e.target.checked; });
 $('#jitterBox').addEventListener('change', (e) => { net.jitter = e.target.checked; });
@@ -1697,7 +1737,7 @@ $('#driftBtn').addEventListener('click', async () => { try { await api.drift(); 
 $('#policyBtn').addEventListener('click', async () => { try { await api.publishPolicy(); } catch { } });
 $('#expireBtn').addEventListener('click', async () => { try { await api.expireNow(S.runId); } catch { } });
 $('#resetBtn').addEventListener('click', () => { codexMode = null; doReset(); });
-$('#vizBtn').addEventListener('click', () => { instrument.failed = null; instrument.setMode(instrument.mode === '3d' ? '2d' : '3d'); });
+$('#vizBtn').addEventListener('click', () => { const want = instrument.mode === '3d' ? '2d' : '3d'; instrument.failed = null; store_set('scram.viz', want); instrument.setMode(want); });
 function setView(v) {
   S.view = v;
   $('#viewConsole').hidden = v !== 'console'; $('#viewAudit').hidden = v !== 'audit';
@@ -1744,7 +1784,8 @@ applySize();
 document.documentElement.dataset.theme = store_get('scram.theme') || 'light';
 render();
 (window.requestIdleCallback || ((f) => setTimeout(f, 200)))(() => { instrument.init(); applyTheme(document.documentElement.dataset.theme); });
-window.__scram = { S, server, net, present, evaluate };
+// test hook: only with ?test in the URL. It bypasses every check, so never port it.
+if (new URLSearchParams(location.search).has('test')) window.__scram = { S, server, net, present, evaluate };
 
 </script>
 </body>
