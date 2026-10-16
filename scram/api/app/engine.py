@@ -175,6 +175,7 @@ class Engine:
         final = run.get("_final_state", run["machine_state"])
         result = deepcopy(run)
         result["machine_state"] = final
+        result["current_output_percent"] = self.output
         result["evaluators"] = self._evaluate(result)
         tr = self.traces.get(run["run_id"])
         try:
@@ -374,22 +375,27 @@ class Engine:
 
             # Re-check the approval hash immediately before changing state.
             self.store.audit(run["run_id"], "WRITE_INTENT", {"action_hash": run["action"]["action_hash"], "checkpoint_id": cp["checkpoint_id"]})
-            approval = run["approval"]
-            if _now() >= datetime.fromisoformat(approval["expires_at"]):
-                self._update_run(run, block_reasons=["APPROVAL_EXPIRED"])
-                raise ForbiddenTransition("approval expired before execution")
-            if (approval["action_hash"] != run["action"]["action_hash"]
-                    or approval["decision"] != "approve" or not approval["used"]
-                    or core.decide(run["action"])[0] != "YELLOW"):
-                raise ForbiddenTransition("approval hash changed before execution")
             self._move(run, "EXECUTING")
             self._set_span(run, "execute", "running")
             t = time.time()
-            # A remote timeout can happen after the write has taken effect.
-            wrote = True
-            self._update_run(run, _authorized_at_write=True, execution={
-                "tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
-                "status": "error", "resulting_state": {"output_percent": before["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault})
+            with self.lock:
+                # Persistence and lock acquisition can take time. Validate only
+                # after those waits, immediately before dispatching the write.
+                approval = run["approval"]
+                if self.writes_locked:
+                    raise ForbiddenTransition("writes locked until reset")
+                if _now() >= datetime.fromisoformat(approval["expires_at"]):
+                    run["block_reasons"] = ["APPROVAL_EXPIRED"]
+                    raise ForbiddenTransition("approval expired before execution")
+                if (approval["action_hash"] != run["action"]["action_hash"]
+                        or approval["decision"] != "approve" or not approval["used"]
+                        or core.decide(run["action"])[0] != "YELLOW"):
+                    raise ForbiddenTransition("approval hash changed before execution")
+                # A remote timeout can happen after the write has taken effect.
+                wrote = True
+                self._update_run(run, _authorized_at_write=True, execution={
+                    "tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
+                    "status": "error", "resulting_state": {"output_percent": before["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault})
             after = self.sandbox.adjust_output(delta, fault)
             with self.lock:
                 self.output = after["output_percent"]
@@ -443,6 +449,14 @@ class Engine:
         except Exception:  # noqa: BLE001
             log.exception("rollback failed")
             checksum, verified = "", False
+            # The write may have landed even if its response was lost. A failed
+            # restore does not imply the cached pre-write output is still true.
+            try:
+                observed = self.sandbox.read_state()
+                with self.lock:
+                    self.output = observed["output_percent"]
+            except Exception:
+                log.exception("could not refresh reactor output after failed recovery")
         self._pace(t)
         self._update_run(run, rollback={**run["rollback"], "status": "restored" if verified else "failed", "restored_checksum": checksum, "verified": verified})
         self._trace(tr, "step", "rollback", "TOOL", ok=verified, **{"scram.checksum_before": run["checkpoint"]["checksum"], "scram.checksum_after": checksum})

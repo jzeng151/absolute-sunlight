@@ -303,3 +303,43 @@ def test_reset_conflict_is_http_409(monkeypatch):
     monkeypatch.setattr(engine, "reset", conflict)
     response = TestClient(app, raise_server_exceptions=False).post("/api/reset")
     assert response.status_code == 409
+
+
+def test_unknown_write_with_failed_rollback_refreshes_observed_output(engine, monkeypatch):
+    adjust = engine.sandbox.adjust_output
+    def lost_response(*args):
+        adjust(*args)
+        raise TimeoutError("response lost")
+    monkeypatch.setattr(engine.sandbox, "adjust_output", lost_response)
+    monkeypatch.setattr(engine.sandbox, "write_state", lambda *a: (_ for _ in ()).throw(OSError("rollback unavailable")))
+    v = execute(engine)
+    assert v["machine_state"] == "LOCKED"
+    assert v["current_output_percent"] == engine.sandbox.read_state()["output_percent"] == 74
+
+
+def test_finalized_run_persists_observed_output(engine):
+    result = execute(engine)
+    assert engine.store.runs[result["run_id"]]["current_output_percent"] == 74
+
+
+def test_expiry_is_checked_after_execution_transition_persistence(engine, monkeypatch):
+    v = engine.create_run("C2")
+    save = engine.store.save_run
+    def delayed(run_id, data):
+        save(run_id, data)
+        if data["machine_state"] == "EXECUTING":
+            engine.runs[run_id]["approval"]["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    monkeypatch.setattr(engine.store, "save_run", delayed)
+    result = execute(engine, v)
+    assert result["machine_state"] == "BLOCKED"
+    assert result["execution"] is None
+    assert engine.sandbox.read_state()["output_percent"] == 72
+
+
+def test_new_global_lock_is_checked_immediately_before_write(engine, monkeypatch):
+    def lock_during_checkpoint(_):
+        engine.write_lock_reason = "CONTROL_UNAVAILABLE"
+    monkeypatch.setattr(engine, "_pace", lock_during_checkpoint)
+    result = execute(engine)
+    assert result["machine_state"] == "BLOCKED"
+    assert result["execution"] is None
