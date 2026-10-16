@@ -158,13 +158,15 @@ def test_executor_error_is_counted_even_without_execution_result(engine, monkeyp
     monkeypatch.setattr(engine.sandbox, "adjust_output", lost_response)
     v = approve(engine, engine.create_run("C2"))
     observed = engine.traces[v["run_id"]].evidence
-    assert v["execution"] is None  # Existing core behavior; evidence must not infer zero calls from this.
+    assert v["execution"]["status"] == "error"
+    assert v["machine_state"] == "RESTORED"
+    assert v["rollback"]["verified"]
     assert observed.executor_call_count == 1
     event = next(e for e in observed.events if e.step == "execute")
     assert event.outcome == "error" and event.data["error_type"] == "TimeoutError"
     assert "credential-bearing" not in str(observed.to_dict())
     assert labels(observed)["Rollback verification"] == "INCOMPLETE"
-    assert labels(observed)["Trajectory order"] == "FAIL"
+    assert labels(observed)["Trajectory order"] == "INCOMPLETE"
 
 
 def test_replay_without_artifact_does_not_fabricate_approval_proof(engine):
