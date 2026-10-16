@@ -8,6 +8,7 @@ import pytest
 
 from app import config
 from app.engine import Engine, ForbiddenTransition
+from store_helpers import audit_rows, stored_record
 
 
 @pytest.fixture
@@ -16,7 +17,8 @@ def engine(monkeypatch):
     e = Engine()
     assert e.sandbox_ready.wait(2)
     e.set_fault(False)
-    return e
+    yield e
+    e.close()
 
 
 def settled(e, v):
@@ -100,18 +102,18 @@ def test_tracing_failure_cannot_interrupt_recovery(engine, monkeypatch):
     result = execute(engine, v)
     assert result["machine_state"] == "RESTORED"
     assert result["evaluators"]
-    assert any(a["event"] == "RESTORED" for a in engine.store.audit_log)
+    assert any(a["event"] == "RESTORED" for a in audit_rows(engine.store))
 
 
 def test_terminal_state_waits_for_audit(engine, monkeypatch):
     entered, release = threading.Event(), threading.Event()
-    original = engine.store.audit
-    def delayed(run_id, event, detail=None):
-        if event == "COMPLETED":
+    original = engine.store.finalize_run
+    def delayed(run_id, data):
+        if data["machine_state"] == "COMPLETED":
             entered.set()
             assert release.wait(2)
-        return original(run_id, event, detail)
-    monkeypatch.setattr(engine.store, "audit", delayed)
+        return original(run_id, data)
+    monkeypatch.setattr(engine.store, "finalize_run", delayed)
     v = engine.create_run("C2")
     engine.approve(v["run_id"], "op", v["action"]["action_hash"])
     try:
@@ -171,11 +173,11 @@ def test_concurrent_approvals_cannot_share_checkpoint(engine, monkeypatch):
 
 def test_reset_preserves_audit_and_never_reuses_identity(engine):
     old = execute(engine)
-    audit = deepcopy(engine.store.audit_log)
+    audit = deepcopy(audit_rows(engine.store))
     engine.reset()
     new = engine.create_run("C2")
     assert new["run_id"] != old["run_id"]
-    assert all(row in engine.store.audit_log for row in audit)
+    assert all(row in audit_rows(engine.store) for row in audit)
 
 
 @pytest.mark.parametrize("missing", ["policy", "approval", "checkpoint", "execute", "verify"])
@@ -216,15 +218,15 @@ def test_rejected_intent_cannot_be_approved_after_persistence_failure(engine, mo
 
 
 def test_audit_failure_cannot_persist_unaudited_terminal_state(engine, monkeypatch):
-    original = engine.store.audit
-    def fail_terminal(run_id, event, detail=None):
-        if event == "COMPLETED":
+    original = engine.store.finalize_run
+    def fail_terminal(run_id, data):
+        if data["machine_state"] == "COMPLETED":
             raise OSError("audit unavailable")
-        return original(run_id, event, detail)
-    monkeypatch.setattr(engine.store, "audit", fail_terminal)
+        return original(run_id, data)
+    monkeypatch.setattr(engine.store, "finalize_run", fail_terminal)
     result = execute(engine)
     assert result["machine_state"] == "LOCKED"
-    assert engine.store.runs[result["run_id"]]["machine_state"] != "COMPLETED"
+    assert stored_record(engine.store, "run", result["run_id"])["machine_state"] != "COMPLETED"
 
 
 def test_placeholder_spans_do_not_pass_trajectory(engine, monkeypatch):
@@ -242,24 +244,25 @@ def test_replay_uses_actual_prior_approval_after_clean_write(engine):
 
 
 def test_reset_flushes_failed_finalization_before_discarding_run(engine, monkeypatch):
-    audit = engine.store.audit
-    monkeypatch.setattr(engine.store, "audit", lambda *a: (_ for _ in ()).throw(OSError("offline")))
-    blocked = execute(engine)
+    finalize = engine.store.finalize_run
+    monkeypatch.setattr(engine.store, "finalize_run", lambda *a: (_ for _ in ()).throw(OSError("offline")))
+    blocked = engine.create_run("C3")
     assert blocked["machine_state"] == "BLOCKED"
+    assert blocked["run_id"] in engine.pending_finalizations
     with pytest.raises(OSError):
         engine.reset()
     assert blocked["run_id"] in engine.runs
-    monkeypatch.setattr(engine.store, "audit", audit)
+    monkeypatch.setattr(engine.store, "finalize_run", finalize)
     engine.reset()
-    assert any(row["run"] == blocked["run_id"] and row["event"] == "BLOCKED" for row in engine.store.audit_log)
+    assert any(row["event"] == "BLOCKED" for row in audit_rows(engine.store, blocked["run_id"]))
     assert not engine.pending_finalizations
 
 
 def test_audit_lock_retains_control_unavailable_reason(engine, monkeypatch):
-    audit = engine.store.audit
-    monkeypatch.setattr(engine.store, "audit", lambda *a: (_ for _ in ()).throw(OSError("offline")))
-    execute(engine)
-    monkeypatch.setattr(engine.store, "audit", audit)
+    finalize = engine.store.finalize_run
+    monkeypatch.setattr(engine.store, "finalize_run", lambda *a: (_ for _ in ()).throw(OSError("offline")))
+    assert execute(engine)["machine_state"] == "LOCKED"
+    monkeypatch.setattr(engine.store, "finalize_run", finalize)
     later = execute(engine)
     assert later["block_reasons"] == ["CONTROL_UNAVAILABLE"]
 
@@ -323,7 +326,7 @@ def test_unknown_write_with_failed_rollback_refreshes_observed_output(engine, mo
 
 def test_finalized_run_persists_observed_output(engine):
     result = execute(engine)
-    assert engine.store.runs[result["run_id"]]["current_output_percent"] == 74
+    assert stored_record(engine.store, "run", result["run_id"])["current_output_percent"] == 74
 
 
 def test_expiry_is_checked_after_execution_transition_persistence(engine, monkeypatch):
@@ -354,7 +357,7 @@ def test_stale_approval_reports_state_change(engine):
     execute(engine)
     result = execute(engine, stale)
     assert result["block_reasons"] == ["STATE_CHANGED"]
-    assert engine.store.audit_log[-1]["detail"]["block_reasons"] == ["STATE_CHANGED"]
+    assert audit_rows(engine.store, result["run_id"])[-1]["detail"]["block_reasons"] == ["STATE_CHANGED"]
 
 
 @pytest.mark.parametrize("failure", ["write_response", "first_read"])
@@ -414,7 +417,7 @@ def test_rejection_finishes_despite_evidence_failure(engine, monkeypatch, failur
     if failure == "approval_and_audit":
         assert v["run_id"] in engine.pending_finalizations
     else:
-        saved = engine.store.runs[v["run_id"]]
+        saved = stored_record(engine.store, "run", v["run_id"])
         assert saved["machine_state"] == "BLOCKED"
         assert saved["approval"]["decision"] == "reject"
 
@@ -539,7 +542,7 @@ def test_failed_checkpoint_transition_keeps_published_state(engine, monkeypatch)
     with pytest.raises(OSError):
         engine.approve(v["run_id"], "op", v["action"]["action_hash"])
     assert engine.get(v["run_id"])["machine_state"] == "AWAITING_APPROVAL"
-    assert engine.store.runs[v["run_id"]]["machine_state"] == "AWAITING_APPROVAL"
+    assert stored_record(engine.store, "run", v["run_id"])["machine_state"] == "AWAITING_APPROVAL"
     assert engine.reject(v["run_id"])["machine_state"] == "BLOCKED"
 
 
@@ -553,7 +556,7 @@ def test_reset_accepts_verified_state_after_lost_write_response(engine, monkeypa
     engine.reset()
     assert engine.output == engine.sandbox.read_state()["output_percent"] == 72
     assert not engine.writes_locked
-    assert engine.store.audit_log[-1]["event"] == "RESET"
+    assert audit_rows(engine.store, "reset")[-1]["event"] == "RESET"
 
 
 def test_failed_reset_refreshes_observed_state_and_keeps_lock(engine, monkeypatch):
@@ -601,5 +604,5 @@ def test_aborted_checkpoint_never_remains_running(engine, monkeypatch, failure):
         monkeypatch.setattr(engine.store, "save_approval", lock_after_approval)
     result = execute(engine, run)
     assert result["machine_state"] == "BLOCKED"
-    for snapshot in [result, engine.store.runs[run["run_id"]]]:
+    for snapshot in [result, stored_record(engine.store, "run", run["run_id"])]:
         assert not any(s["status"] == "running" for s in snapshot["trace_spans"])

@@ -7,8 +7,8 @@ from fastapi.testclient import TestClient
 import app.config as config
 
 config.STEP_SECONDS = 0.01
-from app import core  # noqa: E402
-from app.main import app  # noqa: E402
+from app import core, main  # noqa: E402
+from store_helpers import audit_rows
 
 client: TestClient
 
@@ -26,7 +26,7 @@ def wait_settled(run_id, timeout=10):
 @pytest.fixture(autouse=True)
 def fresh():
     global client
-    with TestClient(app) as client:
+    with TestClient(main.app) as client:
         client.post("/api/reset")
         yield
 
@@ -174,7 +174,7 @@ def test_anchor_failure_is_blocked_and_traced(monkeypatch, failure):
     import anchorbrowser
     from app.adapters import memory, trace
 
-    steps, audits = [], []
+    steps = []
 
     def fetch(**kwargs):
         raise failure
@@ -183,14 +183,13 @@ def test_anchor_failure_is_blocked_and_traced(monkeypatch, failure):
     monkeypatch.setattr(config, "ANCHOR_READ_URL", "https://www.nrc.gov/page")
     monkeypatch.setattr(anchorbrowser, "Anchorbrowser", lambda **kw: SimpleNamespace(tools=SimpleNamespace(fetch_webpage=fetch)))
     monkeypatch.setattr(trace.RunTrace, "step", lambda self, name, kind, **kw: steps.append((name, kw)))
-    monkeypatch.setattr(engine.store, "audit", lambda *args: audits.append(args))
     v = client.post("/api/runs", json={"case_id": "C1"}).json()
     assert v["machine_state"] == "BLOCKED"
     assert v["block_reasons"] == ["CONTROL_UNAVAILABLE"]
     assert dict(steps)["read"]["ok"] is False
     assert dict(steps)["read"]["tool.name"] == "anchor.fetch_webpage"
     assert next(s for s in v["trace_spans"] if s["name"] == "read")["status"] == "error"
-    assert audits[-1][1] == "BLOCKED"
+    assert audit_rows(main._engine().store, v["run_id"])[-1]["event"] == "BLOCKED"
     assert "read failed" in memory.facts_for_run(v)[0]
     assert "No tool was executed" not in memory.facts_for_run(v)[0]
 
@@ -204,3 +203,7 @@ def test_anchor_without_key_is_explicitly_skipped(monkeypatch):
     assert v["machine_state"] == "COMPLETED"
     assert v["action"]["tool"] == "analyze_history"
     assert next(s for s in v["trace_spans"] if s["name"] == "read")["status"] == "skipped"
+    evidence = main._engine().traces[v["run_id"]].evidence
+    read = next(event for event in evidence.events if event.step == "read")
+    assert read.outcome == "ok"
+    assert read.data["state_before"] == read.data["state_after"]

@@ -10,7 +10,7 @@ config.STEP_SECONDS = 0.01
 from app.adapters import memory  # noqa: E402
 from app.main import app  # noqa: E402
 
-client = TestClient(app)
+client: TestClient
 
 
 def settle(run_id):
@@ -25,8 +25,10 @@ def settle(run_id):
 
 @pytest.fixture(autouse=True)
 def fresh():
-    client.post("/api/reset")
-    yield
+    global client
+    with TestClient(app) as client:
+        assert client.post("/api/reset").status_code == 204
+        yield
 
 
 def test_fault_run_tells_the_story_in_order():
