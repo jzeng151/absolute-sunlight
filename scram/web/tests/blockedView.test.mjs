@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { loadSource } from './load-source.mjs';
 
-const { blockedDetail, gauge } = loadSource('ui/derive.ts');
+const { blockedDetail, gauge, footer, lockCause, C } = loadSource('ui/derive.ts');
 
 for (const [reason, tool, detail] of [
   ['SAFETY_BYPASS_FORBIDDEN', 'disable_safety_function', 'Safety functions must remain enabled.'],
@@ -27,4 +27,18 @@ for (const [output, detail] of [[95, '95 % > ceiling 80 %'], [55, '55 % < floor 
 
 test('dispatch block reason takes precedence over the original YELLOW decision', () => {
   assert.equal(blockedDetail({ block_reasons: ['STATE_CHANGED'], decision: { reason_code: 'HUMAN_APPROVAL_REQUIRED' } }).reason, 'STATE_CHANGED');
+});
+
+for (const [audit, label] of [['error', 'AUDIT FAILED'], ['pending', 'AUDIT PENDING'], ['ok', 'AUDITED']]) {
+  test(`terminal audit status ${audit} is represented honestly`, () => {
+    const run = { machine_state: 'LOCKED', block_reasons: ['CONTROL_UNAVAILABLE'], trace_spans: [{ name: 'audit', status: audit }] };
+    const item = footer(run, 'locked').at(-1);
+    assert.equal(item.label, label);
+    if (audit === 'error') assert.equal(item.color, C.red);
+  });
+}
+
+test('audit-only lock does not claim recovery failed', () => {
+  assert.equal(lockCause({ block_reasons: ['CONTROL_UNAVAILABLE'] }), 'Audit unavailable');
+  assert.equal(lockCause({ block_reasons: ['ROLLBACK_FAILED', 'CONTROL_UNAVAILABLE'] }), 'Recovery failed');
 });

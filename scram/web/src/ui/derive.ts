@@ -33,6 +33,12 @@ export function blockedDetail(run: RunView): { reason: string; detail: string } 
   return { reason, detail: details[reason] ?? 'The action did not satisfy its authorization requirements.' };
 }
 
+export function lockCause(run: RunView): string {
+  if (run.block_reasons.includes('ROLLBACK_FAILED')) return 'Recovery failed';
+  if (run.block_reasons.includes('CONTROL_UNAVAILABLE')) return 'Audit unavailable';
+  return 'Writes locked';
+}
+
 export type Mode = 'idle' | 'green' | 'red' | 'yellow' | 'exec' | 'restored' | 'completed' | 'rejected' | 'replay' | 'locked';
 
 export function modeOf(run: RunView | null): Mode {
@@ -157,7 +163,10 @@ export function footer(run: RunView | null, mode: Mode): FooterItem[] {
   else if (ms === 'ROLLING_BACK') items.push(active('ROLLBACK', C.red));
   else items.push(off('ROLLBACK'));
   const settled = ['green', 'red', 'replay', 'rejected', 'restored', 'completed', 'locked'].includes(mode);
-  items.push(settled ? done('AUDITED') : off('AUDITED'));
+  const audit = run.trace_spans.find(s => s.name === 'audit');
+  items.push(audit?.status === 'ok' ? done('AUDITED')
+    : audit?.status === 'error' ? done('AUDIT FAILED', C.red)
+    : settled ? active('AUDIT PENDING', C.yellow) : off('AUDITED'));
   return items;
 }
 
