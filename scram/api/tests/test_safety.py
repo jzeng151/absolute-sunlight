@@ -248,3 +248,58 @@ def test_reset_flushes_failed_finalization_before_discarding_run(engine, monkeyp
     engine.reset()
     assert any(row["run"] == blocked["run_id"] and row["event"] == "BLOCKED" for row in engine.store.audit_log)
     assert not engine.pending_finalizations
+
+
+def test_audit_lock_retains_control_unavailable_reason(engine, monkeypatch):
+    audit = engine.store.audit
+    monkeypatch.setattr(engine.store, "audit", lambda *a: (_ for _ in ()).throw(OSError("offline")))
+    execute(engine)
+    monkeypatch.setattr(engine.store, "audit", audit)
+    later = execute(engine)
+    assert later["block_reasons"] == ["CONTROL_UNAVAILABLE"]
+
+
+def test_executor_cannot_mutate_a_run_during_a_snapshot(engine, monkeypatch):
+    import app.engine as module
+    adjusting, return_response = threading.Event(), threading.Event()
+    snapshot_started, release_snapshot = threading.Event(), threading.Event()
+    original_adjust = engine.sandbox.adjust_output
+    def adjust(*args):
+        result = original_adjust(*args)
+        adjusting.set()
+        assert return_response.wait(2)
+        return result
+    monkeypatch.setattr(engine.sandbox, "adjust_output", adjust)
+    v = engine.create_run("C2")
+    engine.approve(v["run_id"], "op", v["action"]["action_hash"])
+    assert adjusting.wait(2)
+    original_copy = module.deepcopy
+    def copy(value):
+        if threading.current_thread().name == "snapshot-reader":
+            snapshot_started.set()
+            assert release_snapshot.wait(2)
+        return original_copy(value)
+    monkeypatch.setattr(module, "deepcopy", copy)
+    reader = threading.Thread(target=lambda: engine.get(v["run_id"]), name="snapshot-reader")
+    reader.start()
+    try:
+        assert snapshot_started.wait(2)
+        before = original_copy(engine.runs[v["run_id"]])
+        return_response.set()
+        time.sleep(0.05)
+        assert engine.runs[v["run_id"]] == before
+    finally:
+        return_response.set()
+        release_snapshot.set()
+        reader.join(2)
+    assert settled(engine, v)["machine_state"] == "COMPLETED"
+
+
+def test_reset_conflict_is_http_409(monkeypatch):
+    from fastapi.testclient import TestClient
+    from app.main import app, engine
+    def conflict():
+        raise ForbiddenTransition("sandbox not ready")
+    monkeypatch.setattr(engine, "reset", conflict)
+    response = TestClient(app, raise_server_exceptions=False).post("/api/reset")
+    assert response.status_code == 409

@@ -93,7 +93,7 @@ def set_fault(body: Fault):
 
 @app.post("/api/reset", status_code=204)
 def reset():
-    engine.reset()
+    _guard(engine.reset)
     return Response(status_code=204)
 
 
