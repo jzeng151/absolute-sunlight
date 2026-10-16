@@ -21,7 +21,7 @@ from uuid import uuid4
 
 from . import config, core
 from .evidence import checksum as evidence_checksum
-from .adapters import others, trace
+from .adapters import memory, others, trace
 from .adapters.sandbox import make_sandbox
 from .adapters.store import make_store
 
@@ -136,6 +136,7 @@ class Engine:
             "writes_locked": self.writes_locked,
             "arize": "on" if trace.enabled else "local only",
             "surrealdb": f"{self.store.kind} ({self.store.url})",
+            "agent_memory": "on" if memory.enabled() else "off",
             "elevenlabs": "key set" if config.ELEVENLABS_API_KEY else "cached clips only",
             "anchor": "off",
             "model": config.GEMINI_MODEL if config.GEMINI_API_KEY else "prepared actions",
@@ -212,6 +213,7 @@ class Engine:
         # Readers cannot observe terminal state before its evidence is complete.
         run.update(result)
         run.pop("_final_state", None)
+        memory.record_run(run)
 
     @synchronized
     def view(self, run: dict) -> dict[str, Any]:
@@ -672,6 +674,7 @@ class Engine:
             self.fault = True
             self.store.wipe_runs()
             self.write_lock_reason = None
+            memory.record_reset(self.output)
 
     def _close_sandbox(self) -> None:
         # A failed initializer can fall back to local execution while its
