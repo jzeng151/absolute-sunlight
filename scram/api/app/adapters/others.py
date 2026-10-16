@@ -20,7 +20,7 @@ Request: """
 
 
 def parse_with_model(text: str) -> dict[str, Any] | None:
-    """Return the model's structured reading, or None if no model is configured or the call fails."""
+    """None means no model is configured. Invalid or failed replies fail closed."""
     if not config.GEMINI_API_KEY:
         return None
     try:
@@ -32,13 +32,14 @@ def parse_with_model(text: str) -> dict[str, Any] | None:
             "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
         }
         # Key goes in a header, never the URL: httpx errors print the URL into the logs.
-        r = httpx.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body, timeout=5)  # a slow network falls back to the prepared action, never stalls the demo
+        r = httpx.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body, timeout=5)
         r.raise_for_status()
         raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
-        return json.loads(raw)
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
     except Exception:  # noqa: BLE001
-        log.exception("Gemini parse failed; using the prepared typed action")
-        return None
+        log.exception("Gemini parse failed; blocking uncertain action")
+        return {}
 
 
 # ---------- ElevenLabs: control-room voice lines ----------

@@ -5,6 +5,7 @@ Allowed path:
   CLASSIFIED: GREEN → COMPLETED | YELLOW → AWAITING_APPROVAL | RED → BLOCKED
   AWAITING_APPROVAL: approved → CHECKPOINTING | rejected/expired/hash mismatch → BLOCKED
   CHECKPOINTING → EXECUTING → VERIFYING → COMPLETED | ROLLING_BACK → RESTORED | LOCKED
+  EXECUTING → BLOCKED only when the final dispatch gate aborts before any tool call
 Forbidden transitions raise ForbiddenTransition and are logged.
 """
 from __future__ import annotations
@@ -12,8 +13,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from typing import Any
+from uuid import uuid4
 
 from . import config, core
 from .adapters import others, trace
@@ -27,7 +31,7 @@ ALLOWED = {
     "CLASSIFIED": {"COMPLETED", "AWAITING_APPROVAL", "BLOCKED"},
     "AWAITING_APPROVAL": {"CHECKPOINTING", "BLOCKED"},
     "CHECKPOINTING": {"EXECUTING", "BLOCKED"},
-    "EXECUTING": {"VERIFYING", "ROLLING_BACK"},
+    "EXECUTING": {"VERIFYING", "ROLLING_BACK", "BLOCKED"},
     "VERIFYING": {"COMPLETED", "ROLLING_BACK"},
     "ROLLING_BACK": {"RESTORED", "LOCKED"},
 }
@@ -49,9 +53,19 @@ def _span(name: str, status: str, detail: str = "") -> dict[str, str]:
     return {"name": name, "status": status, "detail": detail}
 
 
+def synchronized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class Engine:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self.transaction_lock = threading.Lock()
+        self.write_lock_reason: str | None = None
         self.store = make_store()
         self.store.seed_rules(core.RULEBOOK)
         self.sandbox = make_sandbox()
@@ -60,7 +74,10 @@ class Engine:
         self.runs: dict[str, dict[str, Any]] = {}
         self.traces: dict[str, trace.RunTrace] = {}
         self.used_approval_hashes: set[str] = set()
+        self.last_c2_approval_hash: str | None = None
+        self.pending_finalizations: dict[str, dict] = {}
         self.output = core.REACTOR["output_percent"]
+        self.verified_output = self.output
         self.sandbox_ready = threading.Event()
         threading.Thread(target=self._init_sandbox, daemon=True).start()
 
@@ -73,6 +90,7 @@ class Engine:
         try:
             st = self.sandbox.write_state(self._initial_state())
             self.output = st["output_percent"]
+            self.verified_output = self.output
             log.info("sandbox ready (%s)", self.sandbox.name)
         except Exception:  # noqa: BLE001
             log.exception("sandbox init failed; switching to local sandbox")
@@ -97,13 +115,27 @@ class Engine:
 
     # ---------- helpers ----------
 
+    @property
+    def writes_locked(self) -> bool:
+        return self.write_lock_reason is not None
+
+    @synchronized
+    def _update_run(self, run: dict, **data) -> None:
+        run.update(data)
+
+    @synchronized
     def _move(self, run: dict, to: str) -> None:
+        if run.get("_final_state") is not None:
+            raise ForbiddenTransition("run already has a terminal decision")
         frm = run["machine_state"]
         if frm in ALLOWED and to not in ALLOWED[frm]:
             log.error("forbidden transition %s -> %s on %s", frm, to, run["run_id"])
             raise ForbiddenTransition(f"{frm} → {to} is not allowed")
-        run["machine_state"] = to
+        if to in {"COMPLETED", "BLOCKED", "RESTORED", "LOCKED"}:
+            run["_final_state"] = to
+            return
         self.store.save_run(run["run_id"], {"machine_state": to, "scenario_id": run["scenario_id"]})
+        run["machine_state"] = to
 
     def _get(self, run_id: str) -> dict[str, Any]:
         run = self.runs.get(run_id)
@@ -115,32 +147,67 @@ class Engine:
         ex = run["execution"]
         ver = run["verification"]
         rb = run["rollback"]
-        blocked = run["machine_state"] == "BLOCKED"
-        order = [s["name"].split(" ")[0] for s in run["trace_spans"]]
+        order = [s["name"].split(" ")[0] for s in run["trace_spans"] if s["status"] in {"ok", "error"}]
         idx = {n: i for i, n in enumerate(order)}
-        seq_ok = all(idx[a] < idx[b] for a, b in [("policy", "approval"), ("approval", "checkpoint"), ("checkpoint", "execute"), ("execute", "verify")] if a in idx and b in idx)
+        required = ["policy", "approval", "checkpoint", "execute", "verify"]
+        seq_ok = ex is None or (all(n in idx for n in required)
+                               and all(idx[a] < idx[b] for a, b in zip(required, required[1:])))
+        approval = run["approval"]
+        authorized = bool(approval and approval["decision"] == "approve" and approval["used"]
+                          and approval["action_hash"] == run["action"]["action_hash"]
+                          and run.get("_authorized_at_write", False))
         results = [
             {"name": "Unauthorized execution", "description": "RED or invalid approval never reaches a tool.",
-             "pass": not (blocked and ex is not None)},
+             "pass": ex is None or (run["decision"]["state"] == "YELLOW" and authorized)},
             {"name": "Approval integrity", "description": "Matching, unexpired, unused hash.",
-             "pass": ex is None or (run["approval"] is not None and run["approval"]["action_hash"] == run["action"]["action_hash"])},
+             "pass": ex is None or authorized},
             {"name": "Rollback verification", "description": "Failed postcondition ends restored.",
-             "pass": ver is None or ver["pass"] or bool(rb and rb["verified"])},
+             "pass": bool(rb["verified"]) if rb else (ex is None or bool(ver and ver["pass"]))},
             {"name": "Trajectory order", "description": "No step skipped or out of sequence.", "pass": seq_ok},
         ]
         return results
 
-    def _finish(self, run: dict) -> None:
-        run["evaluators"] = self._evaluate(run)
-        tr = self.traces.get(run["run_id"])
-        self.store.audit(run["run_id"], run["machine_state"], {"block_reasons": run["block_reasons"]})
-        if tr:
-            tr.step("audit", "CHAIN", recorded=True)
-            tr.evals(run["evaluators"])
-            tr.close(run["machine_state"])
+    def _trace(self, tr, method: str, *args, **kwargs) -> None:
+        try:
+            getattr(tr, method)(*args, **kwargs)
+        except Exception:
+            log.exception("trace export failed during %s", method)
 
+    @synchronized
+    def _finish(self, run: dict) -> None:
+        final = run.get("_final_state", run["machine_state"])
+        result = deepcopy(run)
+        result["machine_state"] = final
+        result["current_output_percent"] = self.output
+        result["evaluators"] = self._evaluate(result)
+        tr = self.traces.get(run["run_id"])
+        recorded = False
+        try:
+            self._set_span(result, "audit", "ok", "recorded")
+            self.store.finalize_run(run["run_id"], result)
+        except Exception:
+            log.exception("could not finalize audit for %s", run["run_id"])
+            self.write_lock_reason = self.write_lock_reason or "CONTROL_UNAVAILABLE"
+            result["machine_state"] = "LOCKED" if run["execution"] else "BLOCKED"
+            result["block_reasons"] = list(dict.fromkeys(
+                [*result["block_reasons"], self.write_lock_reason, "CONTROL_UNAVAILABLE"]))
+            self._set_span(result, "audit", "error", "audit unavailable; writes locked")
+            if "ROLLBACK_FAILED" not in result["block_reasons"]:
+                result["voice_line"] = None
+            self.pending_finalizations[run["run_id"]] = deepcopy(result)
+        else:
+            recorded = True
+        if tr:
+            self._trace(tr, "step", "audit", "CHAIN", recorded=recorded)
+            self._trace(tr, "evals", result["evaluators"])
+            self._trace(tr, "close", result["machine_state"])
+        # Readers cannot observe terminal state before its evidence is complete.
+        run.update(result)
+        run.pop("_final_state", None)
+
+    @synchronized
     def view(self, run: dict) -> dict[str, Any]:
-        v = {k: val for k, val in run.items() if not k.startswith("_")}
+        v = deepcopy({k: val for k, val in run.items() if not k.startswith("_")})
         v["current_output_percent"] = self.output
         return v
 
@@ -149,10 +216,18 @@ class Engine:
     def create_run(self, case_id: str) -> dict[str, Any]:
         if case_id not in core.CASES:
             raise NotFound(case_id)
+        # Model I/O must not hold the lock used by polling and finalization.
+        reading = others.parse_with_model(core.CASES[case_id]["request_text"])
+        return self._create_run(case_id, reading)
+
+    @synchronized
+    def _create_run(self, case_id: str, reading) -> dict[str, Any]:
+        if case_id not in core.CASES:
+            raise NotFound(case_id)
         case = core.CASES[case_id]
         with self.lock:
             self.counter += 1
-            run_id = f"run_0{self.counter}"
+            run_id = f"run_{uuid4().hex}"
         tr = trace.RunTrace(run_id, case_id)
         self.traces[run_id] = tr
 
@@ -165,15 +240,20 @@ class Engine:
         }
         self.runs[run_id] = run
 
-        # 1. Normalize. The model reads the words; the prepared typed action is the contract.
-        reading = others.parse_with_model(case["request_text"])
-        confidence = float(reading.get("confidence", 1.0)) if reading else 1.0
-        run["action"] = core.typed_action_from_case(case, run_id, ACTOR, confidence)
-        model = config.GEMINI_MODEL if reading else "prepared"
-        tr.step("normalize", "LLM" if reading else "CHAIN", **{"input.value": case["request_text"], "output.value": str(reading or run["action"]), "scram.confidence": confidence, "llm.model_name": model})
-        run["trace_spans"].append(_span("normalize", "ok", "Gemini" if reading else "prepared"))
+        # 1. Normalize the model's action; only no-model mode uses the fixture.
+        using_model = reading is not None
+        try:
+            run["action"] = (core.typed_action_from_reading(reading, run_id, ACTOR, self.verified_output) if using_model
+                             else core.typed_action_from_case(case, run_id, ACTOR, current_output=self.verified_output))
+            confidence = run["action"]["confidence"]
+        except ValueError:
+            confidence = 0.0
+        model = config.GEMINI_MODEL if using_model else "prepared"
+        tr.step("normalize", "LLM" if using_model else "CHAIN", ok=confidence >= config.PARSE_MIN_CONFIDENCE,
+                **{"input.value": case["request_text"], "output.value": str(reading if using_model else run["action"]), "scram.confidence": confidence, "llm.model_name": model})
+        run["trace_spans"].append(_span("normalize", "ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "error", "Gemini" if using_model else "prepared"))
         if confidence < config.PARSE_MIN_CONFIDENCE:
-            run["machine_state"] = "BLOCKED"
+            run["_final_state"] = "BLOCKED"
             run["block_reasons"] = ["PARSE_UNCERTAIN"]
             run["decision"] = {"run_id": run_id, "policy_version": core.POLICY_VERSION, "rule_ids": [], "state": "RED", "reason_code": "PARSE_UNCERTAIN", "reversible": False, "approval_required": False}
             self._finish(run)
@@ -203,14 +283,14 @@ class Engine:
         if state == "RED":
             self._move(run, "BLOCKED")
             run["block_reasons"] = [reason]
-            run["voice_line"] = others.VOICE_LINES["red"]
+            run["voice_line"] = others.VOICE_LINES["red"] if reason == "BOUNDARY_EXCEEDED" else None
             run["trace_spans"] += [_span("execute", "skipped", "never"), _span("audit", "ok", "recorded")]
             self._finish(run)
             return self.view(run)
 
         if case_id == "C4":
             # The operator changed +2 % to +3 % and tried to reuse the earlier approval.
-            c2_hash = core.typed_action_from_case(core.CASES["C2"], run_id, ACTOR)["action_hash"]
+            c2_hash = self.last_c2_approval_hash or core.typed_action_from_case(core.CASES["C2"], run_id, ACTOR, current_output=self.verified_output)["action_hash"]
             run["approved_hash"] = c2_hash
             reasons = ["HASH_MISMATCH"] + (["APPROVAL_ALREADY_USED"] if c2_hash in self.used_approval_hashes else [])
             self._move(run, "BLOCKED")
@@ -223,35 +303,48 @@ class Engine:
 
         self._move(run, "AWAITING_APPROVAL")
         run["approval_expires_at"] = (_now() + timedelta(seconds=config.APPROVAL_TTL_SECONDS)).isoformat()
-        run["voice_line"] = others.VOICE_LINES["yellow"]
+        # The cached clip describes exactly +2 to 74; other targets stay in
+        # the approval panel without contradictory prerecorded narration.
+        run["voice_line"] = (others.VOICE_LINES["yellow"]
+                             if run["action"]["normalized_parameters"] == {"delta_percent": 2}
+                             and run["action"]["expected_postcondition"] == {"output_percent": 74} else None)
         run["trace_spans"].append(_span("approval", "running", "waiting"))
         return self.view(run)
 
+    @synchronized
     def reject(self, run_id: str) -> dict[str, Any]:
         run = self._get(run_id)
-        if run["machine_state"] != "AWAITING_APPROVAL":
+        if run["machine_state"] != "AWAITING_APPROVAL" or run.get("_final_state") is not None:
             raise ForbiddenTransition("run is not awaiting approval")
         self._move(run, "BLOCKED")
         run["block_reasons"] = ["APPROVAL_REJECTED"]
         run["voice_line"] = None
-        run["approval"] = {"approval_id": f"apv_{run_id[-4:]}", "actor_id": ACTOR, "action_hash": run["action"]["action_hash"],
+        run["approval"] = {"approval_id": f"apv_{run_id}", "actor_id": ACTOR, "action_hash": run["action"]["action_hash"],
                            "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": True, "decision": "reject"}
-        self.store.save_approval(run["approval"])
-        self.traces[run_id].step("approval", "GUARDRAIL", ok=False, **{"scram.decision": "reject"})
+        try:
+            self.store.save_approval(run["approval"])
+        except Exception:
+            log.exception("could not persist rejected approval for %s", run_id)
+            self.write_lock_reason = self.write_lock_reason or "CONTROL_UNAVAILABLE"
+            run["block_reasons"].append("CONTROL_UNAVAILABLE")
+        # Finalization retains the rejected artifact in the terminal record,
+        # or queues that entire record if the audit sink is unavailable too.
+        self._trace(self.traces[run_id], "step", "approval", "GUARDRAIL", ok=False, **{"scram.decision": "reject"})
         run["trace_spans"][-1] = _span("approval", "error", "rejected")
         run["trace_spans"].append(_span("audit", "ok", "recorded"))
         self._finish(run)
         return self.view(run)
 
+    @synchronized
     def approve(self, run_id: str, actor_id: str, presented_hash: str | None) -> dict[str, Any]:
         run = self._get(run_id)
-        if run["machine_state"] != "AWAITING_APPROVAL":
+        if run["machine_state"] != "AWAITING_APPROVAL" or run.get("_final_state") is not None:
             raise ForbiddenTransition("run is not awaiting approval")
         tr = self.traces[run_id]
         expected = run["action"]["action_hash"]
         expired = _now() > datetime.fromisoformat(run["approval_expires_at"])
-        if presented_hash != expected or expired:
-            reason = "APPROVAL_EXPIRED" if expired else "HASH_MISMATCH"
+        if presented_hash != expected or expired or self.writes_locked:
+            reason = self.write_lock_reason or ("APPROVAL_EXPIRED" if expired else "HASH_MISMATCH")
             self._move(run, "BLOCKED")
             run["block_reasons"] = [reason]
             run["approved_hash"] = presented_hash
@@ -261,10 +354,12 @@ class Engine:
             self._finish(run)
             return self.view(run)
 
-        run["approval"] = {"approval_id": f"apv_{run_id[-4:]}", "actor_id": actor_id, "action_hash": expected,
+        run["approval"] = {"approval_id": f"apv_{run_id}", "actor_id": actor_id, "action_hash": expected,
                            "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": True, "decision": "approve"}
-        self.used_approval_hashes.add(expected)
         self.store.save_approval(run["approval"])
+        self.used_approval_hashes.add(expected)
+        if run["scenario_id"] == "C2":
+            self.last_c2_approval_hash = expected
         tr.step("approval", "GUARDRAIL", **{"scram.approver": actor_id, "scram.action_hash": expected})
         run["trace_spans"][-1] = _span("approval", "ok", expected)
         run["trace_spans"] += [_span("checkpoint", "running"), _span("execute", "pending"), _span("verify", "pending")]
@@ -273,11 +368,13 @@ class Engine:
         threading.Thread(target=self._execute, args=(run, self.fault), daemon=True).start()
         return self.view(run)
 
+    @synchronized
     def get(self, run_id: str) -> dict[str, Any]:
         return self.view(self._get(run_id))
 
     # ---------- execution (background) ----------
 
+    @synchronized
     def _set_span(self, run: dict, name: str, status: str, detail: str = "") -> None:
         for i, s in enumerate(run["trace_spans"]):
             if s["name"] == name:
@@ -286,34 +383,67 @@ class Engine:
         run["trace_spans"].append(_span(name, status, detail))
 
     def _execute(self, run: dict, fault: bool) -> None:
+        with self.transaction_lock:
+            with self.lock:
+                # Reset can discard a queued worker before it acquires the transaction.
+                if self.runs.get(run["run_id"]) is not run:
+                    return
+            self._execute_transaction(run, fault)
+
+    def _execute_transaction(self, run: dict, fault: bool) -> None:
         tr = self.traces[run["run_id"]]
         expected = run["action"]["expected_postcondition"]["output_percent"]
         delta = run["action"]["normalized_parameters"]["delta_percent"]
-        self.sandbox_ready.wait(timeout=180)
         wrote = False
         before: dict[str, Any] = {}
         try:
+            if self.writes_locked:
+                raise ForbiddenTransition("writes locked until reset")
+            if not self.sandbox_ready.wait(timeout=180):
+                raise TimeoutError("sandbox initialization is still pending")
             # Checkpoint: read the state inside the sandbox and store the copy.
             t = time.time()
             before = self.sandbox.read_state()
-            cp = {"checkpoint_id": f"ckpt_{run['run_id'][-4:]}", "run_id": run["run_id"], "before_state": {"output_percent": before["output_percent"]}, "checksum": core.state_checksum(before)}
+            if before["output_percent"] + delta != expected:
+                self._update_run(run, block_reasons=["STATE_CHANGED"])
+                raise ForbiddenTransition("reactor state changed; request a fresh approval")
+            cp = {"checkpoint_id": f"ckpt_{run['run_id']}", "run_id": run["run_id"], "before_state": {"output_percent": before["output_percent"]}, "checksum": core.state_checksum(before)}
             self.store.save_checkpoint({**cp, "full_state": before})
-            run["checkpoint"] = cp
+            self._update_run(run, checkpoint=cp)
             tr.step("checkpoint", "TOOL", **{"scram.checksum": cp["checksum"], "scram.sandbox": self.sandbox.name})
             self._set_span(run, "checkpoint", "ok", cp["checkpoint_id"])
             self._pace(t)
 
             # Re-check the approval hash immediately before changing state.
-            if run["approval"]["action_hash"] != run["action"]["action_hash"]:
-                raise ForbiddenTransition("approval hash changed before execution")
+            self.store.audit(run["run_id"], "WRITE_INTENT", {"action_hash": run["action"]["action_hash"], "checkpoint_id": cp["checkpoint_id"]})
             self._move(run, "EXECUTING")
-            self._set_span(run, "execute", "running")
             t = time.time()
-            after = self.sandbox.adjust_output(delta, fault)
-            wrote = True
-            self.output = after["output_percent"]
-            run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
-                                "status": "success", "resulting_state": {"output_percent": after["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
+            with self.lock:
+                # Persistence and lock acquisition can take time. Validate only
+                # after those waits, immediately before dispatching the write.
+                approval = run["approval"]
+                if self.writes_locked:
+                    raise ForbiddenTransition("writes locked until reset")
+                if _now() >= datetime.fromisoformat(approval["expires_at"]):
+                    run["block_reasons"] = ["APPROVAL_EXPIRED"]
+                    raise ForbiddenTransition("approval expired before execution")
+                if (approval["action_hash"] != run["action"]["action_hash"]
+                        or approval["decision"] != "approve" or not approval["used"]
+                        or core.decide(run["action"])[0] != "YELLOW"):
+                    run["block_reasons"] = ["HASH_MISMATCH"]
+                    raise ForbiddenTransition("approval hash changed before execution")
+                self._set_span(run, "execute", "running")
+                # A remote timeout can happen after the write has taken effect.
+                wrote = True
+                self._update_run(run, _authorized_at_write=True, execution={
+                    "tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
+                    "status": "error", "resulting_state": {"output_percent": before["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault})
+                # Hold the same lock that publishes global audit failures until
+                # the executor returns, so a new lock cannot overtake dispatch.
+                after = self.sandbox.adjust_output(delta, fault)
+                self.output = after["output_percent"]
+                run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
+                                    "status": "success", "resulting_state": {"output_percent": after["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
             tr.step("execute", "TOOL", **{"tool.name": "adjust_output", "scram.sandbox": self.sandbox.name, "scram.fault_injected": fault, "scram.tool_status": "success"})
             self._set_span(run, "execute", "ok", self.sandbox.name.capitalize())
             self._pace(t)
@@ -324,15 +454,17 @@ class Engine:
             t = time.time()
             actual = self.sandbox.read_state()["output_percent"]
             ok = actual == expected
-            run["verification"] = {"expected_postcondition": {"output_percent": expected}, "actual_state": {"output_percent": actual},
-                                   "pass": ok, "reason_code": None if ok else "POSTCONDITION_FAILED", "diff": "0" if ok else f"{actual - expected:+g}"}
+            self._update_run(run, verification={"expected_postcondition": {"output_percent": expected}, "actual_state": {"output_percent": actual},
+                                               "pass": ok, "reason_code": None if ok else "POSTCONDITION_FAILED", "diff": "0" if ok else f"{actual - expected:+g}"})
             tr.step("verify", "EVALUATOR", ok=ok, **{"scram.expected": expected, "scram.actual": actual})
             self._set_span(run, "verify", "ok" if ok else "error", "pass" if ok else f"{actual:g} ≠ {expected:g}")
             self._pace(t)
 
             if ok:
+                with self.lock:
+                    self.verified_output = actual
                 self._move(run, "COMPLETED")
-                run["voice_line"] = None
+                self._update_run(run, voice_line=None)
                 self._set_span(run, "audit", "ok", "recorded")
                 self._finish(run)
                 return
@@ -342,33 +474,54 @@ class Engine:
             if wrote and before:
                 self._rollback(run, before)
             else:
-                run["machine_state"] = "BLOCKED"
-                run["block_reasons"] = ["CONTROL_UNAVAILABLE"]
-                run["voice_line"] = None
+                self._move(run, "BLOCKED")
+                self._update_run(run, voice_line=None,
+                                 block_reasons=run["block_reasons"] or [self.write_lock_reason or "CONTROL_UNAVAILABLE"])
+                with self.lock:
+                    if not any(s["name"] == "checkpoint" and s["status"] == "ok" for s in run["trace_spans"]):
+                        self._set_span(run, "checkpoint", "error", "checkpoint aborted")
+                self._set_span(run, "execute", "skipped", "dispatch aborted")
+                self._set_span(run, "verify", "skipped", "no execution")
                 self._set_span(run, "audit", "ok", f"blocked: {type(e).__name__}")
                 self._finish(run)
 
     def _rollback(self, run: dict, before: dict) -> None:
         tr = self.traces[run["run_id"]]
-        run["machine_state"] = "ROLLING_BACK"
-        run["rollback"] = {"triggered": True, "checkpoint_id": run["checkpoint"]["checkpoint_id"], "status": "running", "restored_checksum": "", "verified": False}
+        self._update_run(run, machine_state="ROLLING_BACK", rollback={"triggered": True, "checkpoint_id": run["checkpoint"]["checkpoint_id"], "status": "running", "restored_checksum": "", "verified": False})
         self._set_span(run, "rollback", "running")
         t = time.time()
         try:
             self.sandbox.write_state(before)
             restored = self.sandbox.read_state()
-            self.output = restored["output_percent"]
+            with self.lock:
+                self.output = restored["output_percent"]
             checksum = core.state_checksum(restored)
             verified = checksum == run["checkpoint"]["checksum"]
         except Exception:  # noqa: BLE001
             log.exception("rollback failed")
             checksum, verified = "", False
+            # The write may have landed even if its response was lost. A failed
+            # restore does not imply the cached pre-write output is still true.
+            try:
+                observed = self.sandbox.read_state()
+                with self.lock:
+                    self.output = observed["output_percent"]
+                checksum = core.state_checksum(observed)
+                verified = checksum == run["checkpoint"]["checksum"]
+            except Exception:
+                log.exception("could not refresh reactor output after failed recovery")
         self._pace(t)
-        run["rollback"].update(status="restored" if verified else "failed", restored_checksum=checksum, verified=verified)
-        tr.step("rollback", "TOOL", ok=verified, **{"scram.checksum_before": run["checkpoint"]["checksum"], "scram.checksum_after": checksum})
+        self._update_run(run, rollback={**run["rollback"], "status": "restored" if verified else "failed", "restored_checksum": checksum, "verified": verified})
+        self._trace(tr, "step", "rollback", "TOOL", ok=verified, **{"scram.checksum_before": run["checkpoint"]["checksum"], "scram.checksum_after": checksum})
         self._set_span(run, "rollback", "ok" if verified else "error", "verified" if verified else "failed")
-        run["machine_state"] = "RESTORED" if verified else "LOCKED"
-        run["voice_line"] = others.VOICE_LINES["restored" if verified else "locked"]
+        with self.lock:
+            run["_final_state"] = "RESTORED" if verified else "LOCKED"
+            if verified:
+                self.verified_output = self.output
+            else:
+                self.write_lock_reason = "ROLLBACK_FAILED"
+                run["block_reasons"] = ["ROLLBACK_FAILED"]
+            run["voice_line"] = others.VOICE_LINES["restored" if verified else "locked"]
         self._set_span(run, "audit", "ok", "recorded")
         self._finish(run)
 
@@ -384,14 +537,32 @@ class Engine:
         self.fault = bool(enabled)
 
     def reset(self) -> None:
-        with self.lock:
+        with self.transaction_lock, self.lock:
+            if not self.sandbox_ready.wait(timeout=180):
+                raise ForbiddenTransition("sandbox initialization is still pending")
+            self.write_lock_reason = self.write_lock_reason or "CONTROL_UNAVAILABLE"
+            # A recovered audit sink must retain failed-finalization evidence
+            # before reset is allowed to discard the corresponding run.
+            for run_id, pending in list(self.pending_finalizations.items()):
+                self.store.finalize_run(run_id, pending)
+                del self.pending_finalizations[run_id]
+            initial = self._initial_state()
+            try:
+                self.sandbox.write_state(initial)
+            except Exception as exc:
+                log.warning("reset write outcome unknown (%s); reading back", type(exc).__name__)
+            restored = self.sandbox.read_state()
+            self.output = restored["output_percent"]
+            if restored != initial:
+                raise ForbiddenTransition("reset state could not be verified")
+            self.verified_output = self.output
+            self.store.audit("reset", "RESET", {"output_percent": restored["output_percent"]})
             for tr in self.traces.values():
-                tr.close("RESET")
+                self._trace(tr, "close", "RESET")
             self.runs.clear()
             self.traces.clear()
             self.used_approval_hashes.clear()
-            self.counter = 417
+            self.last_c2_approval_hash = None
             self.fault = True
             self.store.wipe_runs()
-            self.sandbox_ready.wait(timeout=180)
-            self.output = self.sandbox.write_state(self._initial_state())["output_percent"]
+            self.write_lock_reason = None
