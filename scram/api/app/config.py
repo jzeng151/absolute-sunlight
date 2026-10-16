@@ -22,6 +22,11 @@ def _env(name: str, default: str = "") -> str:
 API_DIR = Path(__file__).resolve().parents[1]
 FIXTURES = API_DIR.parent / "web" / "src" / "fixtures"  # one source of truth, shared with the front end
 
+# Arize AX — traces and evaluators
+ARIZE_SPACE_ID = _env("ARIZE_SPACE_ID")
+ARIZE_API_KEY = _env("ARIZE_API_KEY")
+ARIZE_PROJECT = _env("ARIZE_PROJECT", "scram")
+
 # Behaviour
 STEP_SECONDS = float(_env("STEP_SECONDS", "0.9"))  # minimum pace between execution steps, for the audience
 APPROVAL_TTL_SECONDS = int(_env("APPROVAL_TTL_SECONDS", "300"))
