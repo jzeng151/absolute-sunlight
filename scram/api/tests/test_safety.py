@@ -7,7 +7,7 @@ import time
 import pytest
 
 from app import config
-from app.engine import Engine
+from app.engine import Engine, ForbiddenTransition
 
 
 @pytest.fixture
@@ -196,3 +196,55 @@ def test_unverified_recovery_without_verification_fails_evaluation(engine):
     result["verification"] = None
     result["rollback"] = {"verified": False}
     assert not next(e for e in engine._evaluate(result) if e["name"] == "Rollback verification")["pass"]
+
+
+def test_rejected_intent_cannot_be_approved_after_persistence_failure(engine, monkeypatch):
+    v = engine.create_run("C2")
+    save = engine.store.save_approval
+    monkeypatch.setattr(engine.store, "save_approval", lambda *a: (_ for _ in ()).throw(OSError("offline")))
+    with pytest.raises(OSError):
+        engine.reject(v["run_id"])
+    monkeypatch.setattr(engine.store, "save_approval", save)
+    with pytest.raises(ForbiddenTransition):
+        engine.approve(v["run_id"], "op", v["action"]["action_hash"])
+    assert engine.sandbox.read_state()["output_percent"] == 72
+
+
+def test_audit_failure_cannot_persist_unaudited_terminal_state(engine, monkeypatch):
+    original = engine.store.audit
+    def fail_terminal(run_id, event, detail=None):
+        if event == "COMPLETED":
+            raise OSError("audit unavailable")
+        return original(run_id, event, detail)
+    monkeypatch.setattr(engine.store, "audit", fail_terminal)
+    result = execute(engine)
+    assert result["machine_state"] == "LOCKED"
+    assert engine.store.runs[result["run_id"]]["machine_state"] != "COMPLETED"
+
+
+def test_placeholder_spans_do_not_pass_trajectory(engine, monkeypatch):
+    monkeypatch.setattr(engine.sandbox, "adjust_output", lambda *a: (_ for _ in ()).throw(TimeoutError()))
+    result = execute(engine)
+    assert result["machine_state"] == "RESTORED"
+    assert not next(e for e in result["evaluators"] if e["name"] == "Trajectory order")["pass"]
+
+
+def test_replay_uses_actual_prior_approval_after_clean_write(engine):
+    completed = execute(engine)
+    replay = engine.create_run("C4")
+    assert replay["approved_hash"] == completed["approval"]["action_hash"]
+    assert set(replay["block_reasons"]) == {"HASH_MISMATCH", "APPROVAL_ALREADY_USED"}
+
+
+def test_reset_flushes_failed_finalization_before_discarding_run(engine, monkeypatch):
+    audit = engine.store.audit
+    monkeypatch.setattr(engine.store, "audit", lambda *a: (_ for _ in ()).throw(OSError("offline")))
+    blocked = execute(engine)
+    assert blocked["machine_state"] == "BLOCKED"
+    with pytest.raises(OSError):
+        engine.reset()
+    assert blocked["run_id"] in engine.runs
+    monkeypatch.setattr(engine.store, "audit", audit)
+    engine.reset()
+    assert any(row["run"] == blocked["run_id"] and row["event"] == "BLOCKED" for row in engine.store.audit_log)
+    assert not engine.pending_finalizations
