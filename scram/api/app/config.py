@@ -57,6 +57,10 @@ ELEVENLABS_API_KEY = _env("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = _env("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
 ELEVENLABS_MODEL = _env("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 
+# Anchor Browser — governed, read-only browser action (case C1)
+ANCHOR_API_KEY = _env("ANCHOR_API_KEY")
+ANCHOR_READ_URL = _env("ANCHOR_READ_URL", "https://www.nrc.gov/about-nrc/news-releases/2026")
+
 # Model — parses the operator's words into a typed action. Never decides policy.
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.5-flash-lite")  # ~1 s per parse; 3.8-flash took 4-8 s with the same confidence

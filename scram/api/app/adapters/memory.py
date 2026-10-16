@@ -89,8 +89,11 @@ def facts_for_run(run: dict[str, Any]) -> list[str]:
     out: list[str] = []
     if state == "BLOCKED":
         reasons = ", ".join(run.get("block_reasons") or []) or "policy"
+        outcome = "A read failed and no reactor write was executed" if any(
+            s["name"] == "read" and s["status"] == "error" for s in run["trace_spans"]
+        ) else "No tool was executed"
         out.append(f"SCRAM blocked run {rid} (case {case}) under rule {rule} for {reasons}. "
-                   f"No tool was executed and {REACTOR} was not changed.")
+                   f"{outcome} and {REACTOR} was not changed.")
         return out
     ex, ver, rb = run.get("execution"), run.get("verification"), run.get("rollback")
     apv = run.get("approval")
