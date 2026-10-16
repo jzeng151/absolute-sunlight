@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import rfc8785
 from typing import Any
 
 from . import config
@@ -21,7 +22,7 @@ POLICY_VERSION = RULEBOOK[0]["policy_version"]
 
 
 def canonical_json(obj: Any) -> str:
-    return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return rfc8785.dumps(obj).decode("utf-8")
 
 
 def action_hash(tool: str, target: str, normalized_parameters: dict, expected_postcondition: dict) -> str:
@@ -88,8 +89,8 @@ def typed_action_from_reading(reading: Any, run_id: str, actor_id: str, current_
     if not isinstance(reading, dict):
         raise ValueError("model reply must be an object")
     confidence = reading.get("confidence")
-    if (type(confidence) not in (int, float) or not math.isfinite(confidence)
-            or not 0 <= confidence <= 1):
+    if (type(confidence) not in (int, float) or not 0 <= confidence <= 1
+            or not math.isfinite(confidence)):
         raise ValueError("model confidence must be finite and between zero and one")
     tool = reading.get("tool")
     if not isinstance(tool, str) or tool not in {"adjust_output", "analyze_history", "disable_safety_function", "unknown"}:
@@ -98,8 +99,13 @@ def typed_action_from_reading(reading: Any, run_id: str, actor_id: str, current_
     if type(boundary) is not bool or "delta_percent" not in reading:
         raise ValueError("model action fields are incomplete")
     delta = reading["delta_percent"]
-    if delta is not None and (type(delta) not in (int, float) or not math.isfinite(delta)):
-        raise ValueError("model delta must be finite")
+    if delta is not None:
+        if (type(delta) not in (int, float)
+                or (type(delta) is int and abs(delta) > 2**53 - 1)
+                or not math.isfinite(delta)):
+            raise ValueError("model delta must be a finite JSON number")
+        if type(delta) is float and delta.is_integer() and abs(delta) <= 2**53 - 1:
+            delta = int(delta)
     params = {}
     post = {"output_percent": current_output}
     if tool == "adjust_output":

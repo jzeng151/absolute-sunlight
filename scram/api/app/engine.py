@@ -204,8 +204,15 @@ class Engine:
 
     # ---------- endpoints ----------
 
-    @synchronized
     def create_run(self, case_id: str) -> dict[str, Any]:
+        if case_id not in core.CASES:
+            raise NotFound(case_id)
+        # Model I/O must not hold the lock used by polling and finalization.
+        reading = others.parse_with_model(core.CASES[case_id]["request_text"])
+        return self._create_run(case_id, reading)
+
+    @synchronized
+    def _create_run(self, case_id: str, reading) -> dict[str, Any]:
         if case_id not in core.CASES:
             raise NotFound(case_id)
         case = core.CASES[case_id]
@@ -225,7 +232,6 @@ class Engine:
         self.runs[run_id] = run
 
         # 1. Normalize the model's action; only no-model mode uses the fixture.
-        reading = others.parse_with_model(case["request_text"])
         using_model = reading is not None
         try:
             run["action"] = (core.typed_action_from_reading(reading, run_id, ACTOR, self.output) if using_model

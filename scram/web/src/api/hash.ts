@@ -1,7 +1,7 @@
 // Action hash — SCRAM Build Spec, section 4.
 // SHA-256 of canonical JSON (sorted keys, no whitespace) of
 // { tool, target, normalized_parameters, expected_postcondition }.
-// Python equivalent: json.dumps(obj, sort_keys=True, separators=(",", ":"))
+// Python equivalent: rfc8785.dumps(obj), decoded as UTF-8.
 
 type Json = string | number | boolean | null | Json[] | { [k: string]: Json };
 

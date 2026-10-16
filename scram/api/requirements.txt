@@ -8,3 +8,4 @@ arize-otel>=0.14
 opentelemetry-sdk>=1.40
 elevenlabs>=2.0
 pytest>=8
+rfc8785>=0.1.4,<0.2

@@ -1,9 +1,11 @@
 """Model parsing is untrusted input to the deterministic policy engine."""
 from unittest.mock import Mock
+import threading
 
 import pytest
 
 from app import config
+from app import core
 from app.adapters import others
 from app.engine import Engine
 
@@ -87,3 +89,35 @@ def test_configured_model_failure_does_not_use_prepared_action(monkeypatch):
 def test_no_model_retains_prepared_fallback(engine, monkeypatch):
     monkeypatch.setattr(config, "GEMINI_API_KEY", "")
     assert engine.create_run("C2")["action"]["normalized_parameters"] == {"delta_percent": 2}
+
+
+@pytest.mark.parametrize("field", ["confidence", "delta_percent"])
+def test_oversized_integer_blocks(engine, monkeypatch, field):
+    monkeypatch.setattr(others, "parse_with_model", lambda _: reading(**{field: 10**400}))
+    assert engine.create_run("C2")["block_reasons"] == ["PARSE_UNCERTAIN"]
+
+
+@pytest.mark.parametrize("number,encoded", [(2.0, "2"), (-0.0, "0"), (1e-6, "0.000001"), (1e-7, "1e-7"), (1e20, "100000000000000000000")])
+def test_number_hashing_matches_javascript(number, encoded):
+    assert core.canonical_json({"n": number}) == '{"n":' + encoded + '}'
+
+
+def test_model_io_does_not_block_other_runs(engine, monkeypatch):
+    prior = engine.create_run("C1")
+    entered, release, got_view = threading.Event(), threading.Event(), threading.Event()
+    def slow(_):
+        entered.set()
+        assert release.wait(2)
+        return reading()
+    monkeypatch.setattr(others, "parse_with_model", slow)
+    creator = threading.Thread(target=lambda: engine.create_run("C2"))
+    creator.start()
+    assert entered.wait(2)
+    reader = threading.Thread(target=lambda: (engine.get(prior["run_id"]), got_view.set()))
+    reader.start()
+    try:
+        assert got_view.wait(0.1)
+    finally:
+        release.set()
+        creator.join(2)
+        reader.join(2)
