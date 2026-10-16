@@ -132,8 +132,8 @@ class Engine:
         if to in {"COMPLETED", "BLOCKED", "RESTORED", "LOCKED"}:
             run["_final_state"] = to
             return
-        run["machine_state"] = to
         self.store.save_run(run["run_id"], {"machine_state": to, "scenario_id": run["scenario_id"]})
+        run["machine_state"] = to
 
     def _get(self, run_id: str) -> dict[str, Any]:
         run = self.runs.get(run_id)
@@ -527,18 +527,21 @@ class Engine:
         with self.transaction_lock, self.lock:
             if not self.sandbox_ready.wait(timeout=180):
                 raise ForbiddenTransition("sandbox initialization is still pending")
-            self.write_lock_reason = "CONTROL_UNAVAILABLE"
+            self.write_lock_reason = self.write_lock_reason or "CONTROL_UNAVAILABLE"
             # A recovered audit sink must retain failed-finalization evidence
             # before reset is allowed to discard the corresponding run.
             for run_id, pending in list(self.pending_finalizations.items()):
                 self.store.finalize_run(run_id, pending)
                 del self.pending_finalizations[run_id]
             initial = self._initial_state()
-            self.sandbox.write_state(initial)
+            try:
+                self.sandbox.write_state(initial)
+            except Exception as exc:
+                log.warning("reset write outcome unknown (%s); reading back", type(exc).__name__)
             restored = self.sandbox.read_state()
+            self.output = restored["output_percent"]
             if restored != initial:
                 raise ForbiddenTransition("reset state could not be verified")
-            self.output = restored["output_percent"]
             self.store.audit("reset", "RESET", {"output_percent": restored["output_percent"]})
             for tr in self.traces.values():
                 self._trace(tr, "close", "RESET")

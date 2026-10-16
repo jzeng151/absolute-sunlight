@@ -473,3 +473,41 @@ def test_audit_lock_cannot_interleave_with_dispatch(engine, monkeypatch):
     worker.join(2)
     assert finished.is_set()
     assert interleaved == [False]
+
+
+def test_failed_checkpoint_transition_keeps_published_state(engine, monkeypatch):
+    v = engine.create_run("C2")
+    save = engine.store.save_run
+    def fail_checkpoint(run_id, data):
+        if data["machine_state"] == "CHECKPOINTING":
+            raise OSError("state store offline")
+        save(run_id, data)
+    monkeypatch.setattr(engine.store, "save_run", fail_checkpoint)
+    with pytest.raises(OSError):
+        engine.approve(v["run_id"], "op", v["action"]["action_hash"])
+    assert engine.get(v["run_id"])["machine_state"] == "AWAITING_APPROVAL"
+    assert engine.store.runs[v["run_id"]]["machine_state"] == "AWAITING_APPROVAL"
+    assert engine.reject(v["run_id"])["machine_state"] == "BLOCKED"
+
+
+def test_reset_accepts_verified_state_after_lost_write_response(engine, monkeypatch):
+    execute(engine)
+    write = engine.sandbox.write_state
+    def reset_lost_response(state):
+        write(state)
+        raise TimeoutError("reset response lost")
+    monkeypatch.setattr(engine.sandbox, "write_state", reset_lost_response)
+    engine.reset()
+    assert engine.output == engine.sandbox.read_state()["output_percent"] == 72
+    assert not engine.writes_locked
+    assert engine.store.audit_log[-1]["event"] == "RESET"
+
+
+def test_failed_reset_refreshes_observed_state_and_keeps_lock(engine, monkeypatch):
+    execute(engine)
+    engine.sandbox.write_state({**engine._initial_state(), "output_percent": 75})
+    monkeypatch.setattr(engine.sandbox, "write_state", lambda *a: (_ for _ in ()).throw(TimeoutError("not written")))
+    with pytest.raises(ForbiddenTransition):
+        engine.reset()
+    assert engine.output == 75
+    assert engine.writes_locked
