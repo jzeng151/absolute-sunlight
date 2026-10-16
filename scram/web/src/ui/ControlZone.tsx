@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { shortHash } from '../api/hash';
 import type { RunView } from '../types';
-import { formatParams, ladder, stateColor, type Mode } from './derive';
+import { blockedDetail, formatParams, ladder, lockCause, stateColor, type Mode } from './derive';
 import { VoiceCard } from './VoiceCard';
 import { CodexDrawing, MirrorNote } from './CodexDrawing';
 
@@ -96,8 +96,8 @@ export function ControlZone({ run, mode, caseLabel, busy, onRun, onApprove, onRe
           <p className="state-sub">Action blocked before execution</p>
           <Cells
             items={[
-              ['Reason', run!.decision!.reason_code],
-              ['Violated', `${expected} % > ceiling 80 %`],
+              ['Reason', blockedDetail(run!).reason],
+              ['Constraint', blockedDetail(run!).detail],
               ['Executor calls', '0', 'var(--scram-red)']
             ]}
           />
@@ -226,7 +226,7 @@ export function ControlZone({ run, mode, caseLabel, busy, onRun, onApprove, onRe
 
       {mode === 'locked' && (
         <div className="stage">
-          <p className="state-eyebrow">Recovery failed</p>
+          <p className="state-eyebrow">{lockCause(run!)}</p>
           <h2 className="state-label">LOCKED</h2>
           <p className="state-sub">All writes stopped · operator reset required</p>
         </div>

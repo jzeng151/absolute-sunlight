@@ -2,6 +2,7 @@
 
 Every sponsor integration is optional at runtime: when its key is missing, its adapter
 falls back to a local implementation with the same interface, and /api/health says so.
+SCRAM_EXECUTOR=daytona requires a remote executor and disables that fallback.
 """
 import os
 from pathlib import Path
@@ -26,6 +27,10 @@ FIXTURES = API_DIR.parent / "web" / "src" / "fixtures"  # one source of truth, s
 DAYTONA_API_KEY = _env("DAYTONA_API_KEY")
 DAYTONA_API_URL = _env("DAYTONA_API_URL")
 DAYTONA_TARGET = _env("DAYTONA_TARGET")
+DAYTONA_SNAPSHOT = _env("DAYTONA_SNAPSHOT")
+SCRAM_EXECUTOR = _env("SCRAM_EXECUTOR", "auto").lower()
+if SCRAM_EXECUTOR not in {"auto", "local", "daytona"}:
+    raise ValueError("SCRAM_EXECUTOR must be auto, local, or daytona")
 
 # Arize AX — traces and evaluators
 ARIZE_SPACE_ID = _env("ARIZE_SPACE_ID")
