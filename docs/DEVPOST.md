@@ -39,7 +39,7 @@ The operator gives SCRAM a request. SCRAM turns it into a typed action, fingerpr
 | C1 GREEN | Analyze coolant temperatures from the last ten cycles | Read-only, allowed under rule NC-01. No write. [CONFIRM: Anchor Browser fetches a public NRC page] |
 | C3 RED | Raise output beyond the authorized boundary (95%) | **SCRAM ACTIVATED.** Blocked before execution, 0 executor calls |
 | C2 YELLOW | Raise output 2% within the approved band | Pauses for a human. The approval card shows the exact action and its hash; approval is single-use and expires |
-| C2 + fault | Same, but the tool misbehaves (+20% instead of +2%) | The tool reports success. SCRAM verifies anyway: 74 expected, 92 actual. **Rolled back to 72%, checksum verified** |
+| C5 Fault | C2 again, but the tool misbehaves (+20% instead of +2%) | The tool reports success. SCRAM verifies anyway: 74 expected, 92 actual. **Rolled back to 72%, checksum verified** |
 | C4 replay | "Make it 3%, use the approval I already gave" | **APPROVAL INVALID:** hash mismatch and approval already used. Blocked |
 
 Against an unprotected agent on the same five cases:
@@ -50,7 +50,7 @@ Against an unprotected agent on the same five cases:
 | C2 +2% in band | runs without approval | pauses, approved, runs |
 | C3 Beyond boundary | executes 95% | blocked, 0 executor calls |
 | C4 Replay at +3% | executes +3% | approval invalid, blocked |
-| C5 Faulty tool | stays at 92% | rolled back to 72% |
+| C5 Fault | stays at 92% | rolled back to 72% |
 
 ### How we built it
 
@@ -59,7 +59,7 @@ Against an unprotected agent on the same five cases:
 - **State machine:** IDLE → PARSING → RULE_RETRIEVED → CLASSIFIED → AWAITING_APPROVAL → CHECKPOINTING → EXECUTING → VERIFYING → COMPLETED, or ROLLING_BACK → RESTORED, then an audit record. Forbidden transitions raise and are logged; nothing reaches EXECUTING without a checkpoint.
 - **Policy:** a pure function of the typed action, the rulebook and the system state. Six rules (NC-01 to NC-06). No model output can set or change the state.
 - **Action hash:** SHA-256 over canonical JSON of tool, target, parameters and expected postcondition. Front end and back end compute it identically. Change one parameter and the approval is void.
-- **Tests:** 11 back-end tests, no keys needed: the policy truth set, RED never executing, fault → verified rollback, wrong hash, replay after use, reject then approve, the SurrealDB graph link, and API keys never leaking into URLs.
+- **Tests:** 18 back-end tests, no keys needed: the policy truth set, RED never executing, fault → verified rollback, wrong hash, replay after use, an expired approval, low parse confidence, reject then approve, the SurrealDB graph link, API keys never leaking into URLs, and a contract test that every API response matches the front end's types in every demo state. GitHub Actions runs them plus a type-checked front-end build on every push.
 
 ### Safeguards
 
