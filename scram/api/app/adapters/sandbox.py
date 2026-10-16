@@ -108,6 +108,7 @@ class DaytonaSandbox:
         self._sandbox = None
         self._lock = threading.RLock()
         self._closed = False
+        self._closing = False
 
     @property
     def run_id(self) -> str:
@@ -115,7 +116,7 @@ class DaytonaSandbox:
 
     def _box(self):
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("sandbox is closed")
             if self._sandbox is None:
                 log.info("creating Daytona sandbox")
@@ -129,7 +130,7 @@ class DaytonaSandbox:
             raise ValueError("invalid sandbox adjustment")
         code = _TOOL.format(path=STATE_PATH, op=op, state=json.dumps(state or {}, allow_nan=False), delta=delta, fault=fault)
         with self._lock:
-            if self._closed:
+            if self._closed or self._closing:
                 raise RuntimeError("sandbox is closed")
             try:
                 res = self._box().process.code_run(code, timeout=30)
@@ -153,27 +154,33 @@ class DaytonaSandbox:
         with self._lock:
             if self._closed:
                 return
+            self._closing = True
+            if self._sandbox is not None:
+                for attempt in range(3):
+                    try:
+                        self._client.delete(self._sandbox)
+                        break
+                    except Exception as exc:
+                        log.warning("could not delete sandbox (%s), attempt %s", type(exc).__name__, attempt + 1)
+                        if attempt == 2:
+                            # Keep the sandbox and client available to close()
+                            # again, while rejecting all process operations.
+                            raise RuntimeError("Daytona cleanup failed; close can be retried") from None
             self._closed = True
-            try:
-                if self._sandbox is not None:
-                    self._client.delete(self._sandbox)
-            except Exception as exc:  # noqa: BLE001
-                log.warning("could not delete sandbox (%s)", type(exc).__name__)
-            finally:
-                # Some SDK releases expose close(); others only expose the
-                # underlying HTTP clients. Release their connection pools too.
-                close = getattr(self._client, "close", None)
-                resources = [self._client] if callable(close) else [
-                    getattr(self._client, name, None)
-                    for name in ("_api_client", "_toolbox_api_client", "_http_client", "_event_dispatcher")
-                ]
-                for resource in resources:
-                    close = getattr(resource, "close", None) or getattr(resource, "disconnect", None)
-                    if callable(close):
-                        try:
-                            close()
-                        except Exception as exc:
-                            log.warning("could not close Daytona client (%s)", type(exc).__name__)
+            # Some SDK releases expose close(); others only expose the
+            # underlying HTTP clients. Release pools after deletion succeeds.
+            close = getattr(self._client, "close", None)
+            resources = [self._client] if callable(close) else [
+                getattr(self._client, name, None)
+                for name in ("_api_client", "_toolbox_api_client", "_http_client", "_event_dispatcher")
+            ]
+            for resource in resources:
+                close = getattr(resource, "close", None) or getattr(resource, "disconnect", None)
+                if callable(close):
+                    try:
+                        close()
+                    except Exception as exc:
+                        log.warning("could not close Daytona client (%s)", type(exc).__name__)
 
 
 def make_sandbox():

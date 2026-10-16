@@ -25,6 +25,40 @@ def test_daytona_disables_idle_stop_and_closes_client(monkeypatch):
     client.close.assert_called_once()
 
 
+def test_close_retries_transient_delete_before_releasing_client(monkeypatch):
+    import daytona
+    client = Mock()
+    client.create.return_value = SimpleNamespace(id="test-sandbox", process=Mock())
+    client.delete.side_effect = [TimeoutError("temporary outage"), None]
+    monkeypatch.setattr(daytona, "Daytona", Mock(return_value=client))
+    box = DaytonaSandbox()
+    box._box()
+    box.close()
+    assert client.delete.call_count == 2
+    client.close.assert_called_once()
+    assert box._closed
+
+
+def test_failed_cleanup_can_be_retried_without_resuming_operations(monkeypatch):
+    import daytona
+    client = Mock()
+    client.create.return_value = SimpleNamespace(id="test-sandbox", process=Mock())
+    client.delete.side_effect = TimeoutError("offline")
+    monkeypatch.setattr(daytona, "Daytona", Mock(return_value=client))
+    box = DaytonaSandbox()
+    box._box()
+    with pytest.raises(RuntimeError, match="cleanup"):
+        box.close()
+    assert not box._closed
+    client.close.assert_not_called()
+    with pytest.raises(RuntimeError, match="clos"):
+        box._box()
+    client.delete.side_effect = None
+    box.close()
+    client.close.assert_called_once()
+    assert box._closed
+
+
 def test_sdk_without_public_close_releases_transports():
     box = DaytonaSandbox.__new__(DaytonaSandbox)
     box._lock = threading.Lock()
