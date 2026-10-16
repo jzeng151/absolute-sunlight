@@ -10,7 +10,7 @@ from pydantic import BaseModel
 from starlette.concurrency import run_in_threadpool
 
 from . import config, core
-from .adapters import trace
+from .adapters import memory, trace
 from .engine import Engine, ForbiddenTransition, NotFound
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
@@ -115,3 +115,14 @@ def reset():
 @app.get("/api/evals/baseline")
 def baseline():
     return core.BASELINE
+
+
+@app.get("/api/memory/ask")
+def ask_memory(q: str):
+    """Recall from SurrealDB Agent Memory, e.g. q="Why is reactor_sim_01 at 72%?"."""
+    if not memory.enabled():
+        raise HTTPException(503, "Agent Memory is off: set SPECTRON_URL, SPECTRON_CONTEXT_ID and SPECTRON_API_KEY")
+    try:
+        return memory.ask(q)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"Agent Memory query failed: {type(e).__name__}") from e
