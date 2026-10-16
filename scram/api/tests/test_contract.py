@@ -121,6 +121,15 @@ def test_applicable_evaluators_pass_on_healthy_demo_runs():
             assert all(e["label"] in {"PASS", "N/A"} for e in v["evaluators"]), (v["scenario_id"], v["evaluators"])
 
 
+def test_low_confidence_is_blocked_before_policy(monkeypatch):
+    from app.adapters import others
+    monkeypatch.setattr(others, "parse_with_model", lambda text: {"confidence": 0.5})
+    v = create("C2")
+    assert_matches_types(v)
+    assert v["machine_state"] == "BLOCKED" and v["block_reasons"] == ["PARSE_UNCERTAIN"]
+    assert v["execution"] is None
+
+
 def test_expired_approval_never_executes():
     v = create("C2")
     main._engine().runs[v["run_id"]]["approval_expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()

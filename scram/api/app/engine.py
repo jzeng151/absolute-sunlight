@@ -138,7 +138,7 @@ class Engine:
             "surrealdb": f"{self.store.kind} ({self.store.url})",
             "elevenlabs": "key set" if config.ELEVENLABS_API_KEY else "cached clips only",
             "anchor": "off",
-            "model": "prepared actions",
+            "model": config.GEMINI_MODEL if config.GEMINI_API_KEY else "prepared actions",
             "fault": self.fault,
         }
 
@@ -221,10 +221,17 @@ class Engine:
 
     # ---------- endpoints ----------
 
-    @accepting_work
     def create_run(self, case_id: str) -> dict[str, Any]:
         if self.closed:
             raise ForbiddenTransition("engine is shutting down")
+        if case_id not in core.CASES:
+            raise NotFound(case_id)
+        # Model I/O must not hold the lock used by polling and finalization.
+        reading = others.parse_with_model(core.CASES[case_id]["request_text"])
+        return self._create_run(case_id, reading)
+
+    @accepting_work
+    def _create_run(self, case_id: str, reading) -> dict[str, Any]:
         if case_id not in core.CASES:
             raise NotFound(case_id)
         case = core.CASES[case_id]
@@ -243,10 +250,26 @@ class Engine:
         }
         self.runs[run_id] = run
 
-        # 1. Normalize. The prepared typed action is the contract.
-        run["action"] = core.typed_action_from_case(case, run_id, ACTOR, current_output=self.verified_output)
-        tr.step("normalize", "CHAIN", evidence={"action": run["action"], "action_hash": run["action"]["action_hash"], "intent": run["action"]["intent"]}, **{"input.value": case["request_text"], "output.value": str(run["action"]), "scram.confidence": 1.0, "llm.model_name": "prepared"})
-        run["trace_spans"].append(_span("normalize", "ok", "prepared"))
+        # 1. Normalize the model's action; only no-model mode uses the fixture.
+        using_model = reading is not None
+        try:
+            run["action"] = (core.typed_action_from_reading(reading, run_id, ACTOR, self.verified_output) if using_model
+                             else core.typed_action_from_case(case, run_id, ACTOR, current_output=self.verified_output))
+            confidence = run["action"]["confidence"]
+        except ValueError:
+            confidence = 0.0
+        model = config.GEMINI_MODEL if using_model else "prepared"
+        tr.step("normalize", "LLM" if using_model else "CHAIN", ok=confidence >= config.PARSE_MIN_CONFIDENCE,
+                outcome="ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "failed",
+                evidence={"action": run["action"], "action_hash": run["action"]["action_hash"], "intent": run["action"]["intent"]} if run["action"] else {},
+                **{"input.value": case["request_text"], "output.value": str(reading if using_model else run["action"]), "scram.confidence": confidence, "llm.model_name": model})
+        run["trace_spans"].append(_span("normalize", "ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "error", "Gemini" if using_model else "prepared"))
+        if confidence < config.PARSE_MIN_CONFIDENCE:
+            run["_final_state"] = "BLOCKED"
+            run["block_reasons"] = ["PARSE_UNCERTAIN"]
+            run["decision"] = {"run_id": run_id, "policy_version": core.POLICY_VERSION, "rule_ids": [], "state": "RED", "reason_code": "PARSE_UNCERTAIN", "reversible": False, "approval_required": False}
+            self._finish(run)
+            return self.view(run)
 
         # 2. Rule and policy — deterministic, never the model.
         state, reason, rule_id = core.decide(run["action"])

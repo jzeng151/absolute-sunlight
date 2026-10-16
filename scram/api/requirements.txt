@@ -9,3 +9,4 @@ opentelemetry-sdk>=1.40
 arize==8.59.1
 elevenlabs>=2.0
 pytest>=8
+rfc8785>=0.1.4,<0.2

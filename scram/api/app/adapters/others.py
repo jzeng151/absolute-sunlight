@@ -1,7 +1,46 @@
-"""Control-room voice lines (Build Spec section 9), spoken with ElevenLabs."""
+"""Model parser (Gemini) and voice lines (ElevenLabs)."""
 from __future__ import annotations
 
+import json
+import logging
+from typing import Any
+
 from .. import config
+
+log = logging.getLogger("scram.adapters")
+
+# ---------- Model: words -> typed action. It never sets policy. ----------
+
+_PROMPT = """You convert an operator request about a SIMULATED reactor into JSON. Output only JSON:
+{"tool": "adjust_output" | "analyze_history" | "disable_safety_function" | "unknown",
+ "delta_percent": number | null,   // signed change in output percent, if any
+ "beyond_boundary": boolean,        // true if the request asks to exceed the authorized boundary
+ "confidence": number}              // 0..1, how sure you are of this reading
+Request: """
+
+
+def parse_with_model(text: str) -> dict[str, Any] | None:
+    """None means no model is configured. Invalid or failed replies fail closed."""
+    if not config.GEMINI_API_KEY:
+        return None
+    try:
+        import httpx
+
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{config.GEMINI_MODEL}:generateContent"
+        body = {
+            "contents": [{"parts": [{"text": _PROMPT + text}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0},
+        }
+        # Key goes in a header, never the URL: httpx errors print the URL into the logs.
+        r = httpx.post(url, headers={"x-goog-api-key": config.GEMINI_API_KEY}, json=body, timeout=5)
+        r.raise_for_status()
+        raw = r.json()["candidates"][0]["content"]["parts"][0]["text"]
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:  # noqa: BLE001
+        log.exception("Gemini parse failed; blocking uncertain action")
+        return {}
+
 
 # ---------- ElevenLabs: control-room voice lines ----------
 
