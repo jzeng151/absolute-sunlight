@@ -271,7 +271,7 @@ class Engine:
         if state == "RED":
             self._move(run, "BLOCKED")
             run["block_reasons"] = [reason]
-            run["voice_line"] = others.VOICE_LINES["red"]
+            run["voice_line"] = others.VOICE_LINES["red"] if reason == "BOUNDARY_EXCEEDED" else None
             run["trace_spans"] += [_span("execute", "skipped", "never"), _span("audit", "ok", "recorded")]
             self._finish(run)
             return self.view(run)
