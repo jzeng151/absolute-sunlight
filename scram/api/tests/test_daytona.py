@@ -209,9 +209,10 @@ def test_failed_remote_rollback_locks_writes_until_verified_reset(reactor, sdk, 
     blocked = reactor.approve(other["run_id"], "operator", other["action"]["action_hash"])
     assert blocked["machine_state"] == "BLOCKED"
     assert blocked["block_reasons"] == ["ROLLBACK_FAILED"]
-    with pytest.raises(RuntimeError, match="Daytona request failed"):
+    with pytest.raises(engine_module.ForbiddenTransition, match="reset state could not be verified"):
         reactor.reset()
     assert reactor.writes_locked
+    assert reactor.output == reactor.sandbox.read_state()["output_percent"]
     monkeypatch.setattr(sdk, "code_run", original)
     reactor.reset()
     assert not reactor.writes_locked and reactor.sandbox.read_state() == INITIAL
