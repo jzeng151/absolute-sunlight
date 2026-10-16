@@ -1,44 +1,41 @@
 import type { RunView } from '../types';
-import { REACTOR, gauge, spanMark, type Mode } from './derive';
+import type { FaultState } from '../App';
+import { fixtureLevers } from '../api/fixtureApi';
+import { useState } from 'react';
+import { clockTime, gauge, instrument, spanMark, type Mode } from './derive';
+import { Instrument } from './Instrument';
 
 interface Props {
   run: RunView | null;
   mode: Mode;
-  fault: boolean;
+  fault: FaultState;
   faultLocked: boolean;
   onFault: (v: boolean) => void;
+  lastConfirmedAt: number | null;
+  stale: boolean;
+  fixtureMode: boolean;
 }
 
-export function SystemZone({ run, mode, fault, faultLocked, onFault }: Props) {
+export function SystemZone({ run, mode, fault, faultLocked, onFault, lastConfirmedAt, stale, fixtureMode }: Props) {
   const g = gauge(run, mode);
-  const bandLeft = REACTOR.band_min;
-  const bandWidth = REACTOR.band_max - REACTOR.band_min;
+  const [, bump] = useState(0);
+  const lose = fixtureLevers.loseNextResponse; // re-read each render: the fixture clears it after use
+  const frozen = run?.execution ? `frozen for ${run.run_id}: ${run.execution.fault_injected ? 'on' : 'off'}` : null;
 
   return (
     <section className="zone zone--right" aria-label="System state and evidence">
-      <div style={{ ['--c' as string]: g.color }}>
+      <div style={{ ['--c' as string]: stale ? 'var(--scram-ink-muted)' : g.color }}>
         <h2 className="eyebrow">IV · Simulated system state</h2>
         <p className="out-value">
           {g.value}
           <small> %</small>
         </p>
         <p className="out-label">{g.label}</p>
-        <div
-          className="gauge"
-          role="img"
-          aria-label={`Output ${g.value} percent. Approved band ${REACTOR.band_min} to ${REACTOR.band_max}.${g.target !== null ? ` Marked: ${g.target} percent.` : ''}`}
-        >
-          <div className="gauge__band" style={{ left: `${bandLeft}%`, width: `${bandWidth}%` }} />
-          {g.target !== null && <div className="gauge__target" style={{ left: `${g.target}%`, ['--c' as string]: g.targetColor }} />}
-          <div className="gauge__actual" style={{ left: `${g.value}%` }} />
-        </div>
-        <div className="gauge__scale" aria-hidden="true">
-          <span>0</span>
-          <span>
-            band {REACTOR.band_min}–{REACTOR.band_max}
-          </span>
-          <span>100</span>
-        </div>
+        <p className="confirmed">
+          last confirmed {clockTime(lastConfirmedAt)}
+          {stale && <span style={{ color: 'var(--scram-red)' }}> · may be stale</span>}
+        </p>
+        <Instrument model={instrument(run, mode)} />
       </div>
 
       <div className="demo">
@@ -47,8 +44,32 @@ export function SystemZone({ run, mode, fault, faultLocked, onFault }: Props) {
           <span>
             Inject executor fault <span className="mono muted" style={{ fontSize: 12 }}>(+20 not +2)</span>
           </span>
-          <input type="checkbox" checked={fault} disabled={faultLocked} onChange={(e) => onFault(e.target.checked)} />
+          <input type="checkbox" checked={fault.value} disabled={faultLocked || fault.pending} onChange={(e) => onFault(e.target.checked)} />
         </label>
+        <p className="ack" aria-live="off">
+          {fault.pending ? (
+            <span style={{ color: 'var(--scram-yellow)' }}>server: confirming…</span>
+          ) : fault.error ? (
+            <span style={{ color: 'var(--scram-red)' }}>server did not confirm ({fault.error}) · still {fault.value ? 'on' : 'off'}</span>
+          ) : (
+            <>server: fault {fault.value ? 'on' : 'off'} · confirmed{frozen ? ` · ${frozen}` : ''}</>
+          )}
+        </p>
+        {fixtureMode && (
+          <label>
+            <span>
+              Lose the next reply <span className="mono muted" style={{ fontSize: 12 }}>(fixture only · tests unknown outcome)</span>
+            </span>
+            <input
+              type="checkbox"
+              checked={lose}
+              onChange={(e) => {
+                fixtureLevers.loseNextResponse = e.target.checked;
+                bump((n) => n + 1);
+              }}
+            />
+          </label>
+        )}
       </div>
 
       <div>

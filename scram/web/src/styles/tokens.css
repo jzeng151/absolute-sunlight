@@ -30,7 +30,7 @@
   --scram-size-title:   34px;
   --scram-size-quote:   24px;
   --scram-size-rule:    20px;
-  --scram-size-body:    15px;
+  --scram-size-body:    16px;   /* audit item 8: operational body text ~16px */
   --scram-size-mono:    14px;
   --scram-size-eyebrow: 12px;
 
