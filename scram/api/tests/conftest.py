@@ -6,3 +6,6 @@ for name in ("ARIZE_API_KEY", "ARIZE_SPACE_ID", "DAYTONA_API_KEY", "GEMINI_API_K
              "SPECTRON_API_KEY", "SPECTRON_URL", "SPECTRON_CONTEXT_ID", "SURREAL_USER", "SURREAL_PASS"):
     os.environ[name] = ""
 os.environ["SURREAL_URL"] = "mem://"
+
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
+os.environ["SCRAM_EXECUTOR"] = "local"

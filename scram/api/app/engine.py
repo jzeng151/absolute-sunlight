@@ -65,6 +65,8 @@ def synchronized(method):
 def accepting_work(method):
     @wraps(method)
     def call(self, *args, **kwargs):
+        if self.closed:
+            raise ForbiddenTransition("engine is shutting down")
         with self.lock:
             if self.closed:
                 raise ForbiddenTransition("engine is shutting down")
@@ -82,6 +84,7 @@ class Engine:
         self.store = make_store()
         self.store.seed_rules(core.RULEBOOK)
         self.sandbox = make_sandbox()
+        self.pending_sandbox_cleanup: list[Any] = []
         self.fault = True
         self.counter = 417
         self.runs: dict[str, dict[str, Any]] = {}
@@ -90,6 +93,7 @@ class Engine:
         self.last_c2_approval_hash: str | None = None
         self.pending_finalizations: dict[str, dict] = {}
         self.output = core.REACTOR["output_percent"]
+        self.sandbox_error: str | None = None
         self.verified_output = self.output
         self.sandbox_ready = threading.Event()
         self._initializer = threading.Thread(target=self._init_sandbox, daemon=True)
@@ -106,19 +110,30 @@ class Engine:
             self.output = st["output_percent"]
             self.verified_output = self.output
             log.info("sandbox ready (%s)", self.sandbox.name)
-        except Exception:  # noqa: BLE001
-            log.exception("sandbox init failed; switching to local sandbox")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("sandbox initialization failed (%s)", type(exc).__name__)
             from .adapters.sandbox import LocalSandbox
 
-            self.sandbox = LocalSandbox()
-            self.sandbox.write_state(self._initial_state())
+            self._close_sandbox()
+            if config.SCRAM_EXECUTOR == "daytona":
+                self.sandbox_error = "DAYTONA_INITIALIZATION_FAILED"
+                self.write_lock_reason = "CONTROL_UNAVAILABLE"
+            else:
+                self.sandbox = LocalSandbox("DAYTONA_INITIALIZATION_FAILED")
+                self.sandbox.write_state(self._initial_state())
         finally:
+            if self.closed:
+                self._close_sandbox()
             self.sandbox_ready.set()
 
     def health(self) -> dict[str, Any]:
         return {
-            "daytona": self.sandbox.name,
+            "daytona": self.sandbox.name if self.sandbox_ready.is_set() else "initializing",
             "sandbox_id": self.sandbox.run_id,
+            "sandbox_ready": self.sandbox_ready.is_set() and self.sandbox_error is None and not self.closed,
+            "sandbox_error": self.sandbox_error,
+            "sandbox_fallback_reason": getattr(self.sandbox, "fallback_reason", None),
+            "writes_locked": self.writes_locked,
             "arize": "on" if trace.enabled else "local only",
             "surrealdb": f"{self.store.kind} ({self.store.url})",
             "elevenlabs": "cached clips only",
@@ -208,6 +223,8 @@ class Engine:
 
     @accepting_work
     def create_run(self, case_id: str) -> dict[str, Any]:
+        if self.closed:
+            raise ForbiddenTransition("engine is shutting down")
         if case_id not in core.CASES:
             raise NotFound(case_id)
         case = core.CASES[case_id]
@@ -398,7 +415,7 @@ class Engine:
                 return
         run["trace_spans"].append(_span(name, status, detail))
 
-    def _approval_at_dispatch(self, run: dict, tr: trace.RunTrace) -> dict:
+    def _approval_at_dispatch(self, run: dict, tr: trace.RunTrace, action: dict) -> dict:
         # Persistence and lock acquisition can take time. Validate only
         # after those waits, immediately before dispatching the write.
         approval = run["approval"]
@@ -408,9 +425,15 @@ class Engine:
             run["block_reasons"] = ["APPROVAL_EXPIRED"]
             self._record_dispatch_rejection(run, tr)
             raise ForbiddenTransition("approval expired before execution")
-        if (approval["action_hash"] != run["action"]["action_hash"]
+        # Bind dispatch to the actual payload, including changes made
+        # while checkpointing or persisting the execution transition.
+        computed_hash = core.action_hash(action["tool"], action["target"], action["normalized_parameters"], action["expected_postcondition"])
+        current = run["action"]
+        current_hash = core.action_hash(current["tool"], current["target"], current["normalized_parameters"], current["expected_postcondition"])
+        if (computed_hash != approval["action_hash"] or computed_hash != action["action_hash"]
+                or current_hash != computed_hash or current["action_hash"] != computed_hash
                 or approval["decision"] != "approve" or not approval["used"]
-                or core.decide(run["action"])[0] != "YELLOW"):
+                or core.decide(action)[0] != "YELLOW"):
             run["block_reasons"] = ["HASH_MISMATCH"]
             self._record_dispatch_rejection(run, tr)
             raise ForbiddenTransition("approval hash changed before execution")
@@ -440,19 +463,21 @@ class Engine:
 
     def _execute_transaction(self, run: dict, fault: bool) -> None:
         tr = self.traces[run["run_id"]]
-        expected = run["action"]["expected_postcondition"]["output_percent"]
-        delta = run["action"]["normalized_parameters"]["delta_percent"]
         wrote = False
         before: dict[str, Any] = {}
         try:
-            if self.writes_locked:
+            with self.lock:
+                action = deepcopy(run["action"])
+            expected = action["expected_postcondition"]["output_percent"]
+            delta = action["normalized_parameters"]["delta_percent"]
+            if self.writes_locked or self.closed or self.sandbox_error:
                 raise ForbiddenTransition("writes locked until reset")
-            if not self.sandbox_ready.wait(timeout=180):
+            if not self.sandbox_ready.wait(timeout=180) or self.sandbox_error:
                 raise TimeoutError("sandbox initialization is still pending")
             # Checkpoint: read the state inside the sandbox and store the copy.
             t = time.time()
             before = self.sandbox.read_state()
-            if before["output_percent"] + delta != expected:
+            if before["target"] != action["target"] or before["output_percent"] + delta != expected:
                 self._update_run(run, block_reasons=["STATE_CHANGED"])
                 raise ForbiddenTransition("reactor state changed; request a fresh approval")
             cp = {"checkpoint_id": f"ckpt_{run['run_id']}", "run_id": run["run_id"], "before_state": {"output_percent": before["output_percent"]}, "checksum": core.state_checksum(before)}
@@ -468,18 +493,18 @@ class Engine:
             t = time.time()
             with self.lock:
                 self._set_span(run, "execute", "running")
-                with tr.execution(run["action"], f"sbx_{self.sandbox.run_id}", fault=fault,
-                                  before_dispatch=lambda: self._approval_at_dispatch(run, tr)):
+                with tr.execution(action, f"sbx_{self.sandbox.run_id}", fault=fault,
+                                  before_dispatch=lambda: self._approval_at_dispatch(run, tr, action)):
                     # A remote timeout can happen after the write has taken effect.
                     wrote = True
                     self._update_run(run, _authorized_at_write=True, execution={
-                        "tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
+                        "tool": action["tool"], "target": action["target"], "parameters": action["normalized_parameters"],
                         "status": "error", "resulting_state": {"output_percent": before["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault})
                     # Hold the same lock that publishes global audit failures until
                     # the executor returns, so a new lock cannot overtake dispatch.
                     after = self.sandbox.adjust_output(delta, fault)
                 self.output = after["output_percent"]
-                run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
+                run["execution"] = {"tool": action["tool"], "target": action["target"], "parameters": action["normalized_parameters"],
                                     "status": "success", "resulting_state": {"output_percent": after["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
             self._set_span(run, "execute", "ok", self.sandbox.name.capitalize())
             self._pace(t)
@@ -506,7 +531,7 @@ class Engine:
                 return
             self._rollback(run, before)
         except Exception as e:  # noqa: BLE001
-            log.exception("execution error on %s", run["run_id"])
+            log.warning("execution error on %s (%s)", run["run_id"], type(e).__name__)
             if wrote and before:
                 self._rollback(run, before)
             else:
@@ -534,8 +559,8 @@ class Engine:
                 self.output = restored["output_percent"]
             checksum = core.state_checksum(restored)
             verified = checksum == run["checkpoint"]["checksum"]
-        except Exception:  # noqa: BLE001
-            log.exception("rollback failed")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("rollback failed (%s)", type(exc).__name__)
             checksum, verified = "", False
             # The write may have landed even if its response was lost. A failed
             # restore does not imply the cached pre-write output is still true.
@@ -546,8 +571,8 @@ class Engine:
                     self.output = observed["output_percent"]
                 checksum = core.state_checksum(observed)
                 verified = checksum == run["checkpoint"]["checksum"]
-            except Exception:
-                log.exception("could not refresh reactor output after failed recovery")
+            except Exception as exc:
+                log.warning("could not refresh reactor output after failed recovery (%s)", type(exc).__name__)
         self._pace(t)
         self._update_run(run, rollback={**run["rollback"], "status": "restored" if verified else "failed", "restored_checksum": checksum, "verified": verified})
         self._trace(tr, "step", "rollback", "TOOL", ok=verified, started_at=t, evidence={
@@ -586,6 +611,8 @@ class Engine:
         for worker in workers:
             worker.join()
         self._initializer.join()
+        with self.transaction_lock:
+            self._close_sandbox()
         with self.lock:
             for tr in self.traces.values():
                 tr.close("SHUTDOWN")
@@ -594,7 +621,7 @@ class Engine:
         with self.transaction_lock, self.lock:
             if self.closed:
                 raise ForbiddenTransition("engine is shutting down")
-            if not self.sandbox_ready.wait(timeout=180):
+            if not self.sandbox_ready.wait(timeout=180) or self.sandbox_error:
                 raise ForbiddenTransition("sandbox initialization is still pending")
             self.write_lock_reason = self.write_lock_reason or "CONTROL_UNAVAILABLE"
             # A recovered audit sink must retain failed-finalization evidence
@@ -622,3 +649,18 @@ class Engine:
             self.fault = True
             self.store.wipe_runs()
             self.write_lock_reason = None
+
+    def _close_sandbox(self) -> None:
+        # A failed initializer can fall back to local execution while its
+        # remote sandbox still needs deletion. Preserve that executor and its
+        # client until a later shutdown/close actually completes cleanup.
+        targets = [self.sandbox, *(s for s in self.pending_sandbox_cleanup if s is not self.sandbox)]
+        self.pending_sandbox_cleanup = []
+        for sandbox in targets:
+            close = getattr(sandbox, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    self.pending_sandbox_cleanup.append(sandbox)
+                    log.warning("sandbox cleanup failed (%s); retained for retry", type(exc).__name__)

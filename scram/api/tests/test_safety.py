@@ -300,11 +300,12 @@ def test_executor_cannot_mutate_a_run_during_a_snapshot(engine, monkeypatch):
 
 def test_reset_conflict_is_http_409(monkeypatch):
     from fastapi.testclient import TestClient
-    from app.main import app, engine
+    from app import main
     def conflict():
         raise ForbiddenTransition("sandbox not ready")
-    monkeypatch.setattr(engine, "reset", conflict)
-    response = TestClient(app, raise_server_exceptions=False).post("/api/reset")
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        monkeypatch.setattr(main._engine(), "reset", conflict)
+        response = client.post("/api/reset")
     assert response.status_code == 409
 
 
@@ -477,6 +478,54 @@ def test_audit_lock_cannot_interleave_with_dispatch(engine, monkeypatch):
     worker.join(2)
     assert finished.is_set()
     assert interleaved == [False]
+
+
+def test_queued_action_cannot_change_parameters_under_cached_hash(engine):
+    with engine.transaction_lock:
+        v = engine.create_run("C2")
+        engine.approve(v["run_id"], "op", v["action"]["action_hash"])
+        with engine.lock:
+            action = engine.runs[v["run_id"]]["action"]
+            action["normalized_parameters"]["delta_percent"] = 3
+            action["expected_postcondition"]["output_percent"] = 75
+    result = settled(engine, v)
+    assert result["machine_state"] == "BLOCKED"
+    assert result["block_reasons"] == ["HASH_MISMATCH"]
+    assert result["execution"] is None
+    assert engine.sandbox.read_state()["output_percent"] == 72
+
+
+@pytest.mark.parametrize("field,value", [
+    ("normalized_parameters", {"delta_percent": 3}),
+    ("expected_postcondition", {"output_percent": 75}),
+    ("target", "another-reactor"),
+    ("tool", "another-tool"),
+])
+def test_payload_rechecked_after_execution_persistence(engine, monkeypatch, field, value):
+    v = engine.create_run("C2")
+    save = engine.store.save_run
+
+    def mutate(run_id, data):
+        save(run_id, data)
+        if data.get("machine_state") == "EXECUTING":
+            engine.runs[run_id]["action"][field] = value
+
+    monkeypatch.setattr(engine.store, "save_run", mutate)
+    result = execute(engine, v)
+    assert result["machine_state"] == "BLOCKED"
+    assert result["block_reasons"] == ["HASH_MISMATCH"]
+    assert result["execution"] is None
+    assert engine.sandbox.read_state()["output_percent"] == 72
+
+
+def test_checkpoint_target_must_match_approved_action(engine):
+    v = engine.create_run("C2")
+    engine.sandbox.write_state({"target": "another-reactor", "output_percent": 72})
+    result = execute(engine, v)
+    assert result["machine_state"] == "BLOCKED"
+    assert result["block_reasons"] == ["STATE_CHANGED"]
+    assert result["execution"] is None
+    assert engine.sandbox.read_state() == {"target": "another-reactor", "output_percent": 72}
 
 
 def test_failed_checkpoint_transition_keeps_published_state(engine, monkeypatch):

@@ -105,7 +105,7 @@ def test_lifespan_drains_active_run_before_closing_telemetry(engine, monkeypatch
             assert release.wait(3)
         return original(*args, **kwargs)
     monkeypatch.setattr(owner, name, paused)
-    monkeypatch.setattr(main, "engine", engine)
+    monkeypatch.setattr(main, "Engine", lambda: engine)
     monkeypatch.setattr(trace, "shutdown", exporter_closed.set)
     engine.approve(v["run_id"], "op", v["action"]["action_hash"])
     assert entered.wait(3)
