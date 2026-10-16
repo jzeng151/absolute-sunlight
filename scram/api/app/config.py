@@ -44,6 +44,10 @@ ELEVENLABS_API_KEY = _env("ELEVENLABS_API_KEY")
 ELEVENLABS_VOICE_ID = _env("ELEVENLABS_VOICE_ID", "JBFqnCBsd6RMkjVDRZzb")
 ELEVENLABS_MODEL = _env("ELEVENLABS_MODEL", "eleven_multilingual_v2")
 
+# Model — parses the operator's words into a typed action. Never decides policy.
+GEMINI_API_KEY = _env("GEMINI_API_KEY")
+GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.5-flash-lite")  # ~1 s per parse; 3.8-flash took 4-8 s with the same confidence
+
 # Behaviour
 STEP_SECONDS = float(_env("STEP_SECONDS", "0.9"))  # minimum pace between execution steps, for the audience
 APPROVAL_TTL_SECONDS = int(_env("APPROVAL_TTL_SECONDS", "300"))
