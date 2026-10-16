@@ -68,7 +68,7 @@ def get_run(run_id: str):
 
 @app.get("/api/runs/{run_id}/rules")
 def run_rules(run_id: str):
-    """Which rule governed this run?"""
+    """SurrealDB graph query: which rule governed this run?"""
     return engine.store.rules_for_run(run_id)
 
 

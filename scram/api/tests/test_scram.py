@@ -1,4 +1,4 @@
-"""Runs with no sponsor keys: local sandbox, in-memory store, no-op tracer."""
+"""Runs with no sponsor keys: local sandbox, embedded SurrealDB, no-op tracer."""
 import time
 
 import pytest
@@ -90,6 +90,12 @@ def test_reject_and_double_approve():
     v = client.post("/api/runs", json={"case_id": "C2"}).json()
     assert client.post(f"/api/runs/{v['run_id']}/reject").json()["block_reasons"] == ["APPROVAL_REJECTED"]
     assert client.post(f"/api/runs/{v['run_id']}/approve", json={"actor_id": "op", "action_hash": v["action"]["action_hash"]}).status_code == 409
+
+
+def test_surreal_graph_links_rule():
+    v = client.post("/api/runs", json={"case_id": "C3"}).json()
+    rules = client.get(f"/api/runs/{v['run_id']}/rules").json()
+    assert rules and rules[0]["rule_id"] == "NC-04"
 
 
 def test_gemini_key_never_in_url(monkeypatch):

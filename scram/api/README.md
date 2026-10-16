@@ -31,6 +31,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 |---|---|---|---|
 | **Daytona** | The simulated reactor's state lives in a sandbox. Checkpoint, execute (with the fault), verify and rollback all run as code inside it. | `app/adapters/sandbox.py` | Local sandbox, same interface |
 | **Arize AX** | One trace per run: normalize → policy → approval → checkpoint → execute → verify → rollback → audit. The four evaluator results are attached to the root span as `eval.*` attributes. | `app/adapters/trace.py` | No-op tracer; in-app trace still shows |
+| **SurrealDB** | Rulebook, runs, approvals, checkpoints, append-only audit. Each run links to its governing rule with a graph edge: `run ->governed_by-> rule`. Try `GET /api/runs/{id}/rules`. | `app/adapters/store.py` | `mem://` runs SurrealDB embedded in-process |
 | **ElevenLabs** | Six control-room voice lines, generated ahead of time so the demo never waits. Run `python -m scripts.make_voice_clips`. | `scripts/make_voice_clips.py` | Text shows, no audio |
 | **Gemini (free)** | Reads the operator's words and reports a confidence. Below 0.8 the request is blocked. It never sets GREEN / YELLOW / RED. | `app/adapters/others.py` | Prepared typed actions |
 
@@ -43,7 +44,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 | POST | `/api/runs/{id}/approve` `{actor_id, action_hash}` | Hash-checked approval; starts execution in the background |
 | POST | `/api/runs/{id}/reject` | Ends in BLOCKED |
 | GET | `/api/runs/{id}` | Current `RunView` (front end polls while it moves) |
-| GET | `/api/runs/{id}/rules` | Rules that governed the run |
+| GET | `/api/runs/{id}/rules` | SurrealDB graph: rules that governed the run |
 | POST | `/api/fault` `{enabled}` | Toggle the executor fault |
 | POST | `/api/reset` | Fresh state, sandbox reset to 72 % |
 | GET | `/api/evals/baseline` | Unsafe baseline vs SCRAM table |
@@ -55,4 +56,4 @@ pytest -q          # 10 tests, no keys needed
 ```
 
 Covers the policy truth set, RED never executing, the fault → verified rollback, clean completion,
-a wrong hash, replay after use and reject then approve (409).
+a wrong hash, replay after use, reject then approve (409), and the SurrealDB graph link.
