@@ -136,7 +136,7 @@ class Engine:
             "writes_locked": self.writes_locked,
             "arize": "on" if trace.enabled else "local only",
             "surrealdb": f"{self.store.kind} ({self.store.url})",
-            "elevenlabs": "cached clips only",
+            "elevenlabs": "key set" if config.ELEVENLABS_API_KEY else "cached clips only",
             "anchor": "off",
             "model": "prepared actions",
             "fault": self.fault,
