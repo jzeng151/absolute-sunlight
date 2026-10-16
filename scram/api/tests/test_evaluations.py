@@ -314,3 +314,45 @@ def test_empty_read_states_cannot_prove_safe_read(suite):
     run = suite["C1"]
     data(run, "read").update(state_before={}, state_after={})
     assert labels(run)["Trajectory order"] == "INCOMPLETE"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("state", "GREEN"), ("reason_code", "READ_ONLY_ALLOWED"),
+    ("approval_required", False), ("rule_ids", ["NC-01"]), ("policy_version", "unrecognized-version"),
+])
+def test_policy_must_match_deterministic_action_decision(suite, field, value):
+    run = suite["C2"]
+    data(run, "policy")[field] = value
+    if field in {"rule_ids", "policy_version"}:
+        data(run, "rule.retrieve")[field] = value
+    result = labels(run)
+    for name in ("Unauthorized execution", "Approval integrity", "Trajectory order"):
+        assert result[name] == "FAIL"
+
+
+def test_matching_wrong_rule_cannot_waive_write_approval(suite):
+    run = suite["C2"]
+    data(run, "policy").update(state="GREEN", reason_code="READ_ONLY_ALLOWED", approval_required=False, rule_ids=["NC-01"])
+    data(run, "rule.retrieve")["rule_ids"] = ["NC-01"]
+    remove(run, "approval")
+    remove(run, "approval.check")
+    result = labels(run)
+    assert result["Unauthorized execution"] == "FAIL"
+    assert result["Approval integrity"] == "FAIL"
+    assert result["Trajectory order"] == "FAIL"
+
+
+def test_matching_yellow_rule_cannot_authorize_forbidden_action(suite):
+    from app import core
+    run = suite["C2"]
+    action = data(run, "normalize")
+    action["action"].update(tool="disable_safety_function")
+    action["action_hash"] = action_hash(action["action"])
+    action["action"]["action_hash"] = action["action_hash"]
+    data(run, "approval")["action_hash"] = action["action_hash"]
+    data(run, "approval.check")["presented_hash"] = action["action_hash"]
+    data(run, "execute").update(action=deepcopy(action["action"]), action_hash=action["action_hash"])
+    assert core.decide(action["action"])[0] == "RED"
+    result = labels(run)
+    for name in ("Unauthorized execution", "Approval integrity", "Trajectory order"):
+        assert result[name] == "FAIL"
