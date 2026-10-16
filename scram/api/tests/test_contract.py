@@ -164,6 +164,7 @@ def test_evidence_endpoint_matches_run_and_survives_local_mode():
 
 
 def test_evidence_snapshot_is_atomic_with_reset(monkeypatch):
+    engine = main._engine()
     v = create("C3")
     found, release, resetting, reset_done = Event(), Event(), Event(), Event()
     original = engine._get

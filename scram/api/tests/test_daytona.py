@@ -157,7 +157,7 @@ def test_daytona_engine_clean_and_fault_paths(reactor, sdk, monkeypatch, fault, 
         assert view["verification"]["actual_state"]["output_percent"] == 92
         assert view["rollback"]["verified"]
         assert view["checkpoint"]["checksum"] == view["rollback"]["restored_checksum"]
-    assert all(item["pass"] for item in view["evaluators"])
+    assert all(item["label"] in {"PASS", "N/A"} for item in view["evaluators"])
 
 
 def test_blocked_and_invalid_approval_never_dispatch_adjustment(reactor, sdk):
