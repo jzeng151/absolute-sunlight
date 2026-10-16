@@ -64,7 +64,7 @@ class Engine:
     def __init__(self) -> None:
         self.lock = threading.RLock()
         self.transaction_lock = threading.Lock()
-        self.writes_locked = False
+        self.write_lock_reason: str | None = None
         self.store = make_store()
         self.store.seed_rules(core.RULEBOOK)
         self.sandbox = make_sandbox()
@@ -112,6 +112,15 @@ class Engine:
 
     # ---------- helpers ----------
 
+    @property
+    def writes_locked(self) -> bool:
+        return self.write_lock_reason is not None
+
+    @synchronized
+    def _update_run(self, run: dict, **data) -> None:
+        run.update(data)
+
+    @synchronized
     def _move(self, run: dict, to: str) -> None:
         if run.get("_final_state") is not None:
             raise ForbiddenTransition("run already has a terminal decision")
@@ -172,7 +181,7 @@ class Engine:
             self.store.finalize_run(run["run_id"], result)
         except Exception:
             log.exception("could not finalize audit for %s", run["run_id"])
-            self.writes_locked = True
+            self.write_lock_reason = "CONTROL_UNAVAILABLE"
             result["machine_state"] = "LOCKED" if run["execution"] else "BLOCKED"
             result["block_reasons"] = ["CONTROL_UNAVAILABLE"]
             self._set_span(result, "audit", "error", "audit unavailable; writes locked")
@@ -313,7 +322,7 @@ class Engine:
         expected = run["action"]["action_hash"]
         expired = _now() > datetime.fromisoformat(run["approval_expires_at"])
         if presented_hash != expected or expired or self.writes_locked:
-            reason = "ROLLBACK_FAILED" if self.writes_locked else "APPROVAL_EXPIRED" if expired else "HASH_MISMATCH"
+            reason = self.write_lock_reason or ("APPROVAL_EXPIRED" if expired else "HASH_MISMATCH")
             self._move(run, "BLOCKED")
             run["block_reasons"] = [reason]
             run["approved_hash"] = presented_hash
@@ -343,6 +352,7 @@ class Engine:
 
     # ---------- execution (background) ----------
 
+    @synchronized
     def _set_span(self, run: dict, name: str, status: str, detail: str = "") -> None:
         for i, s in enumerate(run["trace_spans"]):
             if s["name"] == name:
@@ -376,7 +386,7 @@ class Engine:
                 raise ForbiddenTransition("reactor state changed; request a fresh approval")
             cp = {"checkpoint_id": f"ckpt_{run['run_id']}", "run_id": run["run_id"], "before_state": {"output_percent": before["output_percent"]}, "checksum": core.state_checksum(before)}
             self.store.save_checkpoint({**cp, "full_state": before})
-            run["checkpoint"] = cp
+            self._update_run(run, checkpoint=cp)
             tr.step("checkpoint", "TOOL", **{"scram.checksum": cp["checksum"], "scram.sandbox": self.sandbox.name})
             self._set_span(run, "checkpoint", "ok", cp["checkpoint_id"])
             self._pace(t)
@@ -385,7 +395,7 @@ class Engine:
             self.store.audit(run["run_id"], "WRITE_INTENT", {"action_hash": run["action"]["action_hash"], "checkpoint_id": cp["checkpoint_id"]})
             approval = run["approval"]
             if _now() >= datetime.fromisoformat(approval["expires_at"]):
-                run["block_reasons"] = ["APPROVAL_EXPIRED"]
+                self._update_run(run, block_reasons=["APPROVAL_EXPIRED"])
                 raise ForbiddenTransition("approval expired before execution")
             if (approval["action_hash"] != run["action"]["action_hash"]
                     or approval["decision"] != "approve" or not approval["used"]
@@ -394,15 +404,16 @@ class Engine:
             self._move(run, "EXECUTING")
             self._set_span(run, "execute", "running")
             t = time.time()
-            run["_authorized_at_write"] = True
             # A remote timeout can happen after the write has taken effect.
             wrote = True
-            run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
-                                "status": "error", "resulting_state": {"output_percent": before["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
+            self._update_run(run, _authorized_at_write=True, execution={
+                "tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
+                "status": "error", "resulting_state": {"output_percent": before["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault})
             after = self.sandbox.adjust_output(delta, fault)
-            self.output = after["output_percent"]
-            run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
-                                "status": "success", "resulting_state": {"output_percent": after["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
+            with self.lock:
+                self.output = after["output_percent"]
+                run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
+                                    "status": "success", "resulting_state": {"output_percent": after["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
             tr.step("execute", "TOOL", **{"tool.name": "adjust_output", "scram.sandbox": self.sandbox.name, "scram.fault_injected": fault, "scram.tool_status": "success"})
             self._set_span(run, "execute", "ok", self.sandbox.name.capitalize())
             self._pace(t)
@@ -413,15 +424,15 @@ class Engine:
             t = time.time()
             actual = self.sandbox.read_state()["output_percent"]
             ok = actual == expected
-            run["verification"] = {"expected_postcondition": {"output_percent": expected}, "actual_state": {"output_percent": actual},
-                                   "pass": ok, "reason_code": None if ok else "POSTCONDITION_FAILED", "diff": "0" if ok else f"{actual - expected:+g}"}
+            self._update_run(run, verification={"expected_postcondition": {"output_percent": expected}, "actual_state": {"output_percent": actual},
+                                               "pass": ok, "reason_code": None if ok else "POSTCONDITION_FAILED", "diff": "0" if ok else f"{actual - expected:+g}"})
             tr.step("verify", "EVALUATOR", ok=ok, **{"scram.expected": expected, "scram.actual": actual})
             self._set_span(run, "verify", "ok" if ok else "error", "pass" if ok else f"{actual:g} ≠ {expected:g}")
             self._pace(t)
 
             if ok:
                 self._move(run, "COMPLETED")
-                run["voice_line"] = None
+                self._update_run(run, voice_line=None)
                 self._set_span(run, "audit", "ok", "recorded")
                 self._finish(run)
                 return
@@ -431,35 +442,35 @@ class Engine:
             if wrote and before:
                 self._rollback(run, before)
             else:
-                run["_final_state"] = "BLOCKED"
-                run["block_reasons"] = run["block_reasons"] or ["CONTROL_UNAVAILABLE"]
-                run["voice_line"] = None
+                self._update_run(run, _final_state="BLOCKED", voice_line=None,
+                                 block_reasons=run["block_reasons"] or [self.write_lock_reason or "CONTROL_UNAVAILABLE"])
                 self._set_span(run, "audit", "ok", f"blocked: {type(e).__name__}")
                 self._finish(run)
 
     def _rollback(self, run: dict, before: dict) -> None:
         tr = self.traces[run["run_id"]]
-        run["machine_state"] = "ROLLING_BACK"
-        run["rollback"] = {"triggered": True, "checkpoint_id": run["checkpoint"]["checkpoint_id"], "status": "running", "restored_checksum": "", "verified": False}
+        self._update_run(run, machine_state="ROLLING_BACK", rollback={"triggered": True, "checkpoint_id": run["checkpoint"]["checkpoint_id"], "status": "running", "restored_checksum": "", "verified": False})
         self._set_span(run, "rollback", "running")
         t = time.time()
         try:
             self.sandbox.write_state(before)
             restored = self.sandbox.read_state()
-            self.output = restored["output_percent"]
+            with self.lock:
+                self.output = restored["output_percent"]
             checksum = core.state_checksum(restored)
             verified = checksum == run["checkpoint"]["checksum"]
         except Exception:  # noqa: BLE001
             log.exception("rollback failed")
             checksum, verified = "", False
         self._pace(t)
-        run["rollback"].update(status="restored" if verified else "failed", restored_checksum=checksum, verified=verified)
+        self._update_run(run, rollback={**run["rollback"], "status": "restored" if verified else "failed", "restored_checksum": checksum, "verified": verified})
         self._trace(tr, "step", "rollback", "TOOL", ok=verified, **{"scram.checksum_before": run["checkpoint"]["checksum"], "scram.checksum_after": checksum})
         self._set_span(run, "rollback", "ok" if verified else "error", "verified" if verified else "failed")
-        run["_final_state"] = "RESTORED" if verified else "LOCKED"
-        if not verified:
-            self.writes_locked = True
-        run["voice_line"] = others.VOICE_LINES["restored" if verified else "locked"]
+        with self.lock:
+            run["_final_state"] = "RESTORED" if verified else "LOCKED"
+            if not verified:
+                self.write_lock_reason = "ROLLBACK_FAILED"
+            run["voice_line"] = others.VOICE_LINES["restored" if verified else "locked"]
         self._set_span(run, "audit", "ok", "recorded")
         self._finish(run)
 
@@ -478,7 +489,7 @@ class Engine:
         with self.transaction_lock, self.lock:
             if not self.sandbox_ready.wait(timeout=180):
                 raise ForbiddenTransition("sandbox initialization is still pending")
-            self.writes_locked = True
+            self.write_lock_reason = "CONTROL_UNAVAILABLE"
             # A recovered audit sink must retain failed-finalization evidence
             # before reset is allowed to discard the corresponding run.
             for run_id, pending in list(self.pending_finalizations.items()):
@@ -499,4 +510,4 @@ class Engine:
             self.fault = True
             self.store.wipe_runs()
             self.output = restored["output_percent"]
-            self.writes_locked = False
+            self.write_lock_reason = None
