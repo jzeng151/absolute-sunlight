@@ -33,8 +33,35 @@ Check what is connected: `curl localhost:8000/api/health`.
 | **Arize AX** | One trace per run. Four deterministic evaluators use recorded evidence; results are uploaded as native AX evaluations on the existing root span. | `app/adapters/trace.py`, `app/evaluators.py` | Evidence and evaluations still run locally |
 | **SurrealDB** | Rulebook, runs, approvals, checkpoints, append-only audit. Each run links to its governing rule with a graph edge: `run ->governed_by-> rule`. Try `GET /api/runs/{id}/rules`. | `app/adapters/store.py` | `mem://` runs SurrealDB embedded in-process |
 | **ElevenLabs** | Six control-room voice lines, generated ahead of time so the demo never waits. Run `python -m scripts.make_voice_clips`. | `scripts/make_voice_clips.py` | Text shows, no audio |
-| **Gemini (free)** | Parses the operator's tool, output change, and boundary request. Invalid replies, confidence below 0.8, and failed calls are blocked. Deterministic policy classifies the validated action. | `app/adapters/others.py` | Prepared typed actions only when no model key is configured |
+| **Amazon Bedrock / Gemini** | Parses the operator's tool, output change, and boundary request. Invalid replies, confidence below 0.8, and failed calls are blocked. Deterministic policy classifies the validated action. | `app/adapters/others.py` | `auto` uses prepared actions when no Gemini key is set; explicit providers fail closed |
 | **Anchor Browser** | Case C1 is a governed, read-only browser action: SCRAM authorizes it as GREEN under NC-01, then Anchor fetches a public NRC page. The tool and URL are hashed before policy checks. Only HTTPS pages on `www.nrc.gov` are allowed. Fetch failures end BLOCKED with CONTROL_UNAVAILABLE. Nothing is submitted. | `app/adapters/others.py` | Read step runs without a browser |
+
+## Model provider
+
+Set `SCRAM_MODEL_PROVIDER=bedrock` to use Amazon Bedrock Converse. The default
+`BEDROCK_MODEL_ID=us.amazon.nova-lite-v1:0` selects the US Nova Lite inference profile;
+set a different Converse-compatible model or inference profile if needed. Set
+`AWS_REGION=us-east-1`, or use `AWS_DEFAULT_REGION` or your AWS profile's region.
+
+Boto3 uses its standard credential chain. Use an ECS task role when deployed and an
+AWS profile or SSO session locally. The role needs `bedrock:InvokeModel` for the chosen
+model/profile and, for cross-region inference, its destination foundation models.
+Credentials stay on the API side. No AWS credentials belong in Vite variables.
+See [Converse permissions](https://docs.aws.amazon.com/bedrock/latest/userguide/conversation-inference-call.html)
+and [Boto3 credentials](https://docs.aws.amazon.com/boto3/latest/guide/credentials.html).
+
+`auto`, the compatibility default, selects Gemini when `GEMINI_API_KEY` is set and
+prepared actions otherwise. `prepared` makes no model calls. Explicit `gemini` uses
+`GEMINI_API_KEY` and `GEMINI_MODEL`. Explicit `bedrock` and `gemini` never fall back to
+prepared actions when credentials, access, the network, or the response fail. These
+failures produce `PARSE_UNCERTAIN`; the existing action validation, approval checks,
+and deterministic policy still apply.
+
+Bedrock calls have a 3-second connection timeout, a 15-second read timeout per attempt,
+and at most two attempts. Truncated or filtered responses and non-JSON output are
+rejected. One complete JSON markdown fence is accepted; surrounding prose and multiple
+documents are rejected. `/api/health` reports the selected `model_provider` and `model`; it does not
+perform a live inference check. Normalize spans record that provider/model too.
 
 ## Endpoints
 

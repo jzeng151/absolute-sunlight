@@ -3,6 +3,7 @@
 Every sponsor integration is optional at runtime: when its key is missing, its adapter
 falls back to a local implementation with the same interface, and /api/health says so.
 SCRAM_EXECUTOR=daytona requires a remote executor and disables that fallback.
+Explicit model providers fail closed instead of using prepared actions.
 """
 import os
 from pathlib import Path
@@ -62,6 +63,12 @@ ANCHOR_API_KEY = _env("ANCHOR_API_KEY")
 ANCHOR_READ_URL = _env("ANCHOR_READ_URL", "https://www.nrc.gov/about-nrc/news-releases/2026")
 
 # Model — parses the operator's words into a typed action. Never decides policy.
+SCRAM_MODEL_PROVIDER = _env("SCRAM_MODEL_PROVIDER", "auto").lower()
+if SCRAM_MODEL_PROVIDER not in {"auto", "prepared", "gemini", "bedrock"}:
+    raise ValueError("SCRAM_MODEL_PROVIDER must be auto, prepared, gemini, or bedrock")
+# Let the AWS SDK use its configured profile region when neither environment variable is set.
+AWS_REGION = _env("AWS_REGION", _env("AWS_DEFAULT_REGION")) or None
+BEDROCK_MODEL_ID = _env("BEDROCK_MODEL_ID", "us.amazon.nova-lite-v1:0")
 GEMINI_API_KEY = _env("GEMINI_API_KEY")
 GEMINI_MODEL = _env("GEMINI_MODEL", "gemini-3.5-flash-lite")  # ~1 s per parse; 3.8-flash took 4-8 s with the same confidence
 
