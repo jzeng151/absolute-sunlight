@@ -7,4 +7,5 @@ daytona>=0.224,<0.225
 arize-otel>=0.14
 opentelemetry-sdk>=1.40
 arize==8.59.1
+elevenlabs>=2.0
 pytest>=8

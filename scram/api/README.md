@@ -31,6 +31,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 |---|---|---|---|
 | **Daytona** | The simulated reactor's state lives in a sandbox. Checkpoint, execute (with the fault), verify and rollback all run as code inside it. | `app/adapters/sandbox.py` | Local sandbox, same interface |
 | **Arize AX** | One trace per run. Four deterministic evaluators use recorded evidence; results are uploaded as native AX evaluations on the existing root span. | `app/adapters/trace.py`, `app/evaluators.py` | Evidence and evaluations still run locally |
+| **ElevenLabs** | Six control-room voice lines, generated ahead of time so the demo never waits. Run `python -m scripts.make_voice_clips`. | `scripts/make_voice_clips.py` | Text shows, no audio |
 
 ## Endpoints
 
