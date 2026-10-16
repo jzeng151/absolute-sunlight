@@ -73,6 +73,8 @@ class Engine:
         self.runs: dict[str, dict[str, Any]] = {}
         self.traces: dict[str, trace.RunTrace] = {}
         self.used_approval_hashes: set[str] = set()
+        self.last_c2_approval_hash: str | None = None
+        self.pending_finalizations: dict[str, dict] = {}
         self.output = core.REACTOR["output_percent"]
         self.sandbox_ready = threading.Event()
         threading.Thread(target=self._init_sandbox, daemon=True).start()
@@ -111,6 +113,8 @@ class Engine:
     # ---------- helpers ----------
 
     def _move(self, run: dict, to: str) -> None:
+        if run.get("_final_state") is not None:
+            raise ForbiddenTransition("run already has a terminal decision")
         frm = run["machine_state"]
         if frm in ALLOWED and to not in ALLOWED[frm]:
             log.error("forbidden transition %s -> %s on %s", frm, to, run["run_id"])
@@ -131,7 +135,7 @@ class Engine:
         ex = run["execution"]
         ver = run["verification"]
         rb = run["rollback"]
-        order = [s["name"].split(" ")[0] for s in run["trace_spans"]]
+        order = [s["name"].split(" ")[0] for s in run["trace_spans"] if s["status"] in {"ok", "error"}]
         idx = {n: i for i, n in enumerate(order)}
         required = ["policy", "approval", "checkpoint", "execute", "verify"]
         seq_ok = ex is None or (all(n in idx for n in required)
@@ -159,20 +163,20 @@ class Engine:
 
     @synchronized
     def _finish(self, run: dict) -> None:
-        final = run.pop("_final_state", run["machine_state"])
+        final = run.get("_final_state", run["machine_state"])
         result = deepcopy(run)
         result["machine_state"] = final
         result["evaluators"] = self._evaluate(result)
         tr = self.traces.get(run["run_id"])
         try:
-            self.store.save_run(run["run_id"], result)
-            self.store.audit(run["run_id"], final, {"block_reasons": run["block_reasons"]})
+            self.store.finalize_run(run["run_id"], result)
         except Exception:
             log.exception("could not finalize audit for %s", run["run_id"])
             self.writes_locked = True
             result["machine_state"] = "LOCKED" if run["execution"] else "BLOCKED"
             result["block_reasons"] = ["CONTROL_UNAVAILABLE"]
             self._set_span(result, "audit", "error", "audit unavailable; writes locked")
+            self.pending_finalizations[run["run_id"]] = deepcopy(result)
         else:
             self._set_span(result, "audit", "ok", "recorded")
         if tr:
@@ -181,6 +185,7 @@ class Engine:
             self._trace(tr, "close", result["machine_state"])
         # Readers cannot observe terminal state before its evidence is complete.
         run.update(result)
+        run.pop("_final_state", None)
 
     @synchronized
     def view(self, run: dict) -> dict[str, Any]:
@@ -246,7 +251,7 @@ class Engine:
 
         if case_id == "C4":
             # The operator changed +2 % to +3 % and tried to reuse the earlier approval.
-            c2_hash = core.typed_action_from_case(core.CASES["C2"], run_id, ACTOR, current_output=self.output)["action_hash"]
+            c2_hash = self.last_c2_approval_hash or core.typed_action_from_case(core.CASES["C2"], run_id, ACTOR, current_output=self.output)["action_hash"]
             run["approved_hash"] = c2_hash
             reasons = ["HASH_MISMATCH"] + (["APPROVAL_ALREADY_USED"] if c2_hash in self.used_approval_hashes else [])
             self._move(run, "BLOCKED")
@@ -266,7 +271,7 @@ class Engine:
     @synchronized
     def reject(self, run_id: str) -> dict[str, Any]:
         run = self._get(run_id)
-        if run["machine_state"] != "AWAITING_APPROVAL":
+        if run["machine_state"] != "AWAITING_APPROVAL" or run.get("_final_state") is not None:
             raise ForbiddenTransition("run is not awaiting approval")
         self._move(run, "BLOCKED")
         run["block_reasons"] = ["APPROVAL_REJECTED"]
@@ -283,7 +288,7 @@ class Engine:
     @synchronized
     def approve(self, run_id: str, actor_id: str, presented_hash: str | None) -> dict[str, Any]:
         run = self._get(run_id)
-        if run["machine_state"] != "AWAITING_APPROVAL":
+        if run["machine_state"] != "AWAITING_APPROVAL" or run.get("_final_state") is not None:
             raise ForbiddenTransition("run is not awaiting approval")
         tr = self.traces[run_id]
         expected = run["action"]["action_hash"]
@@ -301,8 +306,10 @@ class Engine:
 
         run["approval"] = {"approval_id": f"apv_{run_id}", "actor_id": actor_id, "action_hash": expected,
                            "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": True, "decision": "approve"}
-        self.used_approval_hashes.add(expected)
         self.store.save_approval(run["approval"])
+        self.used_approval_hashes.add(expected)
+        if run["scenario_id"] == "C2":
+            self.last_c2_approval_hash = expected
         tr.step("approval", "GUARDRAIL", **{"scram.approver": actor_id, "scram.action_hash": expected})
         run["trace_spans"][-1] = _span("approval", "ok", expected)
         run["trace_spans"] += [_span("checkpoint", "running"), _span("execute", "pending"), _span("verify", "pending")]
@@ -453,6 +460,11 @@ class Engine:
             if not self.sandbox_ready.wait(timeout=180):
                 raise ForbiddenTransition("sandbox initialization is still pending")
             self.writes_locked = True
+            # A recovered audit sink must retain failed-finalization evidence
+            # before reset is allowed to discard the corresponding run.
+            for run_id, pending in list(self.pending_finalizations.items()):
+                self.store.finalize_run(run_id, pending)
+                del self.pending_finalizations[run_id]
             initial = self._initial_state()
             self.sandbox.write_state(initial)
             restored = self.sandbox.read_state()
@@ -464,6 +476,7 @@ class Engine:
             self.runs.clear()
             self.traces.clear()
             self.used_approval_hashes.clear()
+            self.last_c2_approval_hash = None
             self.fault = True
             self.store.wipe_runs()
             self.output = restored["output_percent"]
