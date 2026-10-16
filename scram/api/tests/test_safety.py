@@ -511,3 +511,42 @@ def test_failed_reset_refreshes_observed_state_and_keeps_lock(engine, monkeypatc
         engine.reset()
     assert engine.output == 75
     assert engine.writes_locked
+
+
+def test_new_request_uses_verified_state_during_fault_recovery(engine, monkeypatch):
+    engine.set_fault(True)
+    entered, release = threading.Event(), threading.Event()
+    def pause_after_write(_):
+        if engine.output == 92:
+            entered.set()
+            assert release.wait(2)
+    monkeypatch.setattr(engine, "_pace", pause_after_write)
+    first = engine.create_run("C2")
+    engine.approve(first["run_id"], "op", first["action"]["action_hash"])
+    try:
+        assert entered.wait(2)
+        second = engine.create_run("C2")
+        assert second["action"]["expected_postcondition"]["output_percent"] == 74
+        assert second["decision"]["state"] == "YELLOW"
+    finally:
+        release.set()
+    assert settled(engine, first)["machine_state"] == "RESTORED"
+    engine.set_fault(False)
+    assert execute(engine, second)["machine_state"] == "COMPLETED"
+
+
+@pytest.mark.parametrize("failure", ["state_changed", "read_failed", "locked"])
+def test_aborted_checkpoint_never_remains_running(engine, monkeypatch, failure):
+    run = engine.create_run("C2")
+    if failure == "state_changed":
+        execute(engine)
+    elif failure == "read_failed":
+        monkeypatch.setattr(engine.sandbox, "read_state", lambda: (_ for _ in ()).throw(OSError("offline")))
+    else:
+        def lock_after_approval(_):
+            engine.write_lock_reason = "CONTROL_UNAVAILABLE"
+        monkeypatch.setattr(engine.store, "save_approval", lock_after_approval)
+    result = execute(engine, run)
+    assert result["machine_state"] == "BLOCKED"
+    for snapshot in [result, engine.store.runs[run["run_id"]]]:
+        assert not any(s["status"] == "running" for s in snapshot["trace_spans"])

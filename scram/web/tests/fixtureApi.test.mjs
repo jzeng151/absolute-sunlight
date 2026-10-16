@@ -42,6 +42,17 @@ test('fault rollback restores the latest checkpoint', async () => {
   assert.equal(result.rollback.restored_checksum, result.checkpoint.checksum);
 });
 
+test('new fixture requests use verified output during recovery', async () => {
+  await api.setFault(true);
+  const first = await api.createRun('C2');
+  await api.approve(first, 'operator');
+  now += STEP_MS * 2;
+  assert.equal((await api.getRun(first.run_id)).current_output_percent, 92);
+  const second = await api.createRun('C2');
+  assert.equal(second.action.expected_postcondition.output_percent, 74);
+  assert.equal(second.decision.state, 'YELLOW');
+});
+
 test('new requests advance unpolled executions and enforce the operating band', async () => {
   const first = await api.createRun('C2');
   await api.approve(first, 'operator');

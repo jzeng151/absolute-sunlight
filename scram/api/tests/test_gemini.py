@@ -77,8 +77,10 @@ def test_non_boundary_block_does_not_play_boundary_voice(engine, monkeypatch, to
 
 
 def test_approval_uses_parsed_delta_and_live_state(engine, monkeypatch):
+    from test_safety import execute
+    engine.set_fault(False)
+    assert execute(engine)["current_output_percent"] == 74
     monkeypatch.setattr(others, "parse_with_model", lambda _: reading(delta_percent=3))
-    engine.output = 74
     v = engine.create_run("C2")
     assert v["action"]["normalized_parameters"]["delta_percent"] == 3
     assert v["action"]["expected_postcondition"]["output_percent"] == 77
