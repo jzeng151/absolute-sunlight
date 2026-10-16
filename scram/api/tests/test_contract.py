@@ -16,9 +16,9 @@ from fastapi.testclient import TestClient
 import app.config as config
 
 config.STEP_SECONDS = 0.01
-from app.main import app, engine  # noqa: E402
+from app import main  # noqa: E402
 
-client = TestClient(app)
+client: TestClient
 TYPES = (Path(__file__).resolve().parents[2] / "web" / "src" / "types.ts").read_text(encoding="utf-8")
 MOVING = {"CHECKPOINTING", "EXECUTING", "VERIFYING", "ROLLING_BACK"}
 
@@ -87,9 +87,11 @@ def approve(v: dict, action_hash: str | None = None) -> dict:
 
 @pytest.fixture(autouse=True)
 def fresh():
-    client.post("/api/reset")
-    yield
-    client.post("/api/reset")
+    global client
+    with TestClient(main.app) as client:
+        client.post("/api/reset")
+        yield
+        client.post("/api/reset")
 
 
 def every_demo_state() -> list[dict]:
@@ -121,7 +123,7 @@ def test_applicable_evaluators_pass_on_healthy_demo_runs():
 
 def test_expired_approval_never_executes():
     v = create("C2")
-    engine.runs[v["run_id"]]["approval_expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    main._engine().runs[v["run_id"]]["approval_expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
     out = approve(v)
     assert out["machine_state"] == "BLOCKED" and out["block_reasons"] == ["APPROVAL_EXPIRED"]
     assert out["execution"] is None and out["current_output_percent"] == 72

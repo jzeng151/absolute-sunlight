@@ -29,6 +29,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 
 | Tool | Job in SCRAM | Where | Without a key |
 |---|---|---|---|
+| **Daytona** | The simulated reactor's state lives in a sandbox. Checkpoint, execute (with the fault), verify and rollback all run as code inside it. | `app/adapters/sandbox.py` | Local sandbox, same interface |
 | **Arize AX** | One trace per run. Four deterministic evaluators use recorded evidence; results are uploaded as native AX evaluations on the existing root span. | `app/adapters/trace.py`, `app/evaluators.py` | Evidence and evaluations still run locally |
 
 ## Endpoints
@@ -98,3 +99,34 @@ correlating the retrieved rule IDs and policy version with the decision. GREEN r
 wait for sandbox readiness. This integration does not fix the core's uncertain-write recovery, reset coordination,
 or write-lock enforcement. An executor timeout after a write therefore produces
 missing-recovery evidence rather than four passing evaluations.
+
+## Daytona execution
+
+`SCRAM_EXECUTOR=auto` uses Daytona when a key is configured and falls back to a local
+executor if startup fails. Use `local` to disable Daytona or `daytona` to require it.
+In required mode, a missing key or client failure prevents startup; failed sandbox
+initialization blocks writes. Restart the API after correcting the configuration.
+An execution failure always attempts recovery in the same sandbox.
+
+`/api/health` reports `sandbox_ready`, `sandbox_error`, `sandbox_fallback_reason`,
+`writes_locked`, and the full `sandbox_id`. Wait for readiness before the demo.
+`DAYTONA_SNAPSHOT` optionally selects a Python snapshot. The sandbox blocks network
+egress, stays active while the API runs, and is deleted on normal shutdown. Abrupt
+process termination still requires external resource cleanup.
+
+The executor checks the payload's canonical hash against its approval immediately
+before dispatch, validates the checkpoint target, and requires one valid state
+response with a successful exit code. State writes use an atomic file replacement.
+Tests run the submitted Python program through a fake SDK transport and disable
+dotenv loading and developer credentials.
+
+To check a real Daytona sandbox after setting `DAYTONA_API_KEY` in `.env`:
+
+```bash
+cd scram/api
+python -m scripts.daytona_smoke
+```
+
+This creates a separate temporary sandbox, checks 72 → 74, injects 72 → 92,
+restores 72, verifies the checkpoint checksum, and requests deletion in `finally`.
+It does not use Arize or the API's active sandbox.

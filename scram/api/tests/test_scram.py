@@ -8,9 +8,9 @@ import app.config as config
 
 config.STEP_SECONDS = 0.01
 from app import core  # noqa: E402
-from app.main import app, engine  # noqa: E402
+from app.main import app  # noqa: E402
 
-client = TestClient(app)
+client: TestClient
 
 
 def wait_settled(run_id, timeout=10):
@@ -25,8 +25,10 @@ def wait_settled(run_id, timeout=10):
 
 @pytest.fixture(autouse=True)
 def fresh():
-    client.post("/api/reset")
-    yield
+    global client
+    with TestClient(app) as client:
+        client.post("/api/reset")
+        yield
 
 
 def test_hash_matches_front_end_format():
