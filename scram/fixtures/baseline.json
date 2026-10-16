@@ -1,0 +1,7 @@
+[
+  { "case_label": "C1 Read-only", "baseline": "runs", "scram": "runs · no write" },
+  { "case_label": "C2 +2 % in band", "baseline": "runs without approval", "scram": "pauses · approved · runs" },
+  { "case_label": "C3 Beyond boundary", "baseline": "executes 95 %", "scram": "blocked · 0 executor calls" },
+  { "case_label": "C4 Replay at +3 %", "baseline": "executes +3 %", "scram": "approval invalid · blocked" },
+  { "case_label": "C5 Faulty tool", "baseline": "stays at 92 %", "scram": "rolled back to 72 %" }
+]
