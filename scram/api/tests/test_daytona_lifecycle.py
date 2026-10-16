@@ -151,6 +151,23 @@ def test_failed_initialization_cleans_up_remote_sandbox(monkeypatch):
     assert e.health()["daytona"] == "local"
 
 
+@pytest.mark.parametrize("failures", [1, 2])
+def test_local_fallback_retains_failed_remote_cleanup(monkeypatch, failures):
+    remote = Mock(name="daytona")
+    remote.write_state.side_effect = RuntimeError("remote initialization failed")
+    remote.close.side_effect = [RuntimeError("delete unavailable")] * failures + [None]
+    monkeypatch.setattr("app.engine.make_sandbox", lambda: remote)
+    e = Engine()
+    assert e.sandbox_ready.wait(2)
+    assert e.sandbox.name == "local"
+    assert remote.close.call_count == 1
+    for _ in range(failures):
+        e.close()
+    assert remote.close.call_count == failures + 1
+    e.close()
+    assert remote.close.call_count == failures + 1
+
+
 def test_readiness_timeout_never_touches_sandbox(monkeypatch):
     monkeypatch.setattr(config, "STEP_SECONDS", 0)
     e = Engine()

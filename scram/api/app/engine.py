@@ -70,6 +70,7 @@ class Engine:
         self.store = make_store()
         self.store.seed_rules(core.RULEBOOK)
         self.sandbox = make_sandbox()
+        self.pending_sandbox_cleanup: list[Any] = []
         self.fault = True
         self.counter = 417
         self.runs: dict[str, dict[str, Any]] = {}
@@ -572,12 +573,19 @@ class Engine:
             self.write_lock_reason = None
 
     def _close_sandbox(self) -> None:
-        close = getattr(self.sandbox, "close", None)
-        if callable(close):
-            try:
-                close()
-            except Exception as exc:
-                log.warning("sandbox cleanup failed (%s)", type(exc).__name__)
+        # A failed initializer can fall back to local execution while its
+        # remote sandbox still needs deletion. Preserve that executor and its
+        # client until a later shutdown/close actually completes cleanup.
+        targets = [self.sandbox, *(s for s in self.pending_sandbox_cleanup if s is not self.sandbox)]
+        self.pending_sandbox_cleanup = []
+        for sandbox in targets:
+            close = getattr(sandbox, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:
+                    self.pending_sandbox_cleanup.append(sandbox)
+                    log.warning("sandbox cleanup failed (%s); retained for retry", type(exc).__name__)
 
     def close(self) -> None:
         with self.lock:
