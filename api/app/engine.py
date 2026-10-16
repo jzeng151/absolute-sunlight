@@ -127,6 +127,7 @@ class Engine:
             self.sandbox_ready.set()
 
     def health(self) -> dict[str, Any]:
+        provider, model = others.model_identity()
         return {
             "daytona": self.sandbox.name if self.sandbox_ready.is_set() else "initializing",
             "sandbox_id": self.sandbox.run_id,
@@ -139,7 +140,8 @@ class Engine:
             "agent_memory": "on" if memory.enabled() else "off",
             "elevenlabs": "key set" if config.ELEVENLABS_API_KEY else "cached clips only",
             "anchor": "on" if config.ANCHOR_API_KEY else "off",
-            "model": config.GEMINI_MODEL if config.GEMINI_API_KEY else "prepared actions",
+            "model_provider": provider,
+            "model": model,
             "fault": self.fault,
         }
 
@@ -264,12 +266,12 @@ class Engine:
                 run["action"] = core.typed_action_from_case(browser_case, run_id, ACTOR, confidence)
         except ValueError:
             confidence = 0.0
-        model = config.GEMINI_MODEL if using_model else "prepared"
+        provider, model = others.model_identity() if using_model else ("prepared", "prepared actions")
         tr.step("normalize", "LLM" if using_model else "CHAIN", ok=confidence >= config.PARSE_MIN_CONFIDENCE,
                 outcome="ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "failed",
                 evidence={"action": run["action"], "action_hash": run["action"]["action_hash"], "intent": run["action"]["intent"]} if run["action"] else {},
-                **{"input.value": case["request_text"], "output.value": str(reading if using_model else run["action"]), "scram.confidence": confidence, "llm.model_name": model})
-        run["trace_spans"].append(_span("normalize", "ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "error", "Gemini" if using_model else "prepared"))
+                **{"input.value": case["request_text"], "output.value": str(reading if using_model else run["action"]), "scram.confidence": confidence, "llm.model_name": model, "llm.provider": provider})
+        run["trace_spans"].append(_span("normalize", "ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "error", f"{provider} / {model}" if using_model else "prepared"))
         if confidence < config.PARSE_MIN_CONFIDENCE:
             run["_final_state"] = "BLOCKED"
             run["block_reasons"] = ["PARSE_UNCERTAIN"]

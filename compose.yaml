@@ -1,0 +1,26 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: api/Dockerfile
+    env_file:
+      - path: api/.env
+        required: false
+    expose:
+      - "8000"
+    stop_grace_period: 120s
+
+  web:
+    build:
+      context: .
+      dockerfile: web/Dockerfile
+      args:
+        VITE_API_MODE: live
+        VITE_API_URL: ""
+    environment:
+      API_UPSTREAM: http://api:8000
+    ports:
+      - "${SCRAM_WEB_PORT:-8080}:8080"
+    depends_on:
+      api:
+        condition: service_healthy

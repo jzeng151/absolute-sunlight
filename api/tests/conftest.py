@@ -9,3 +9,24 @@ os.environ["SURREAL_URL"] = "mem://"
 
 os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 os.environ["SCRAM_EXECUTOR"] = "local"
+
+# The operator's model choice, AWS profile and ECS metadata must never reach a unit test.
+os.environ["SCRAM_MODEL_PROVIDER"] = "auto"
+os.environ["AWS_EC2_METADATA_DISABLED"] = "true"
+os.environ["AWS_SHARED_CREDENTIALS_FILE"] = os.devnull
+os.environ["AWS_CONFIG_FILE"] = os.devnull
+for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_SECURITY_TOKEN",
+             "AWS_PROFILE", "AWS_DEFAULT_PROFILE", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN",
+             "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+             "AWS_CONTAINER_AUTHORIZATION_TOKEN", "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE"):
+    os.environ.pop(name, None)
+
+import pytest
+from botocore.endpoint import Endpoint
+
+
+@pytest.fixture(autouse=True)
+def no_aws_network(monkeypatch):
+    def unexpected_request(*args, **kwargs):
+        pytest.fail("Unit tests must stub AWS requests")
+    monkeypatch.setattr(Endpoint, "make_request", unexpected_request)

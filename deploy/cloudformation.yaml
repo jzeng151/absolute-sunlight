@@ -1,0 +1,457 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SCRAM event demo, one Fargate task behind presenter-restricted CloudFront HTTPS.
+
+# Before creating this stack:
+# 1. Build and push both images to ECR, matching TaskArchitecture.
+# 2. Select an existing VPC and two public subnets in different Availability Zones.
+#    Their route tables must reach an internet gateway; tasks receive a public IP.
+# 3. Resolve com.amazonaws.global.cloudfront.origin-facing in this AWS Region.
+# 4. Supply the presenter's public IPv4 address and a random 32-64 character token.
+#    Keep the token out of command history, committed files, and stack outputs.
+# Deploy with CAPABILITY_IAM. This template does not create ECR repositories.
+# The demo uses in-memory state and one replica; deployments reset state and have downtime.
+
+Parameters:
+  ApiImage:
+    Type: String
+    Description: Full private ECR API image URI, preferably pinned by digest.
+    MinLength: 1
+  WebImage:
+    Type: String
+    Description: Full private ECR web image URI, preferably pinned by digest.
+    MinLength: 1
+  TaskArchitecture:
+    Type: String
+    Default: ARM64
+    AllowedValues: [ARM64, X86_64]
+    Description: Must match both container images.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PublicSubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two public subnets in different Availability Zones within VpcId.
+  CloudFrontPrefixListId:
+    Type: String
+    AllowedPattern: 'pl-[a-f0-9]+'
+    Description: AWS-managed com.amazonaws.global.cloudfront.origin-facing prefix list in this Region.
+  AllowedViewerIp:
+    Type: String
+    AllowedPattern: '((25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])\.){3}(25[0-5]|2[0-4][0-9]|1[0-9]{2}|[1-9]?[0-9])'
+    Description: Presenter's public IPv4 address, without a CIDR suffix. Update when networks change.
+  OriginVerifyHeader:
+    Type: String
+    NoEcho: true
+    MinLength: 32
+    MaxLength: 64
+    AllowedPattern: '[A-Za-z0-9]{32,64}'
+    Description: Random secret value for the X-Scram-Origin header, generated before deployment.
+
+Resources:
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - !Sub arn:${AWS::Partition}:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeNovaLite
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: InvokeUsNovaLiteProfile
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource: !Sub arn:${AWS::Partition}:bedrock:us-west-2:${AWS::AccountId}:inference-profile/us.amazon.nova-lite-v1:0
+              - Sid: InvokeProfileDestinationModels
+                Effect: Allow
+                Action: bedrock:InvokeModel
+                Resource:
+                  - !Sub arn:${AWS::Partition}:bedrock:us-east-1::foundation-model/amazon.nova-lite-v1:0
+                  - !Sub arn:${AWS::Partition}:bedrock:us-east-2::foundation-model/amazon.nova-lite-v1:0
+                  - !Sub arn:${AWS::Partition}:bedrock:us-west-2::foundation-model/amazon.nova-lite-v1:0
+                Condition:
+                  StringEquals:
+                    bedrock:InferenceProfileArn: !Sub arn:${AWS::Partition}:bedrock:us-west-2:${AWS::AccountId}:inference-profile/us.amazon.nova-lite-v1:0
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  ContainerLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 7
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  LoadBalancerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CloudFront origin-facing traffic only.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourcePrefixListId: !Ref CloudFrontPrefixListId
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  TaskSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web traffic from the application load balancer only.
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 8080
+          ToPort: 8080
+          SourceSecurityGroupId: !Ref LoadBalancerSecurityGroup
+      SecurityGroupEgress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Type: application
+      Scheme: internet-facing
+      IpAddressType: ipv4
+      Subnets: !Ref PublicSubnetIds
+      SecurityGroups:
+        - !Ref LoadBalancerSecurityGroup
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '120'
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  WebTargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8080
+      TargetType: ip
+      HealthCheckPath: /healthz
+      HealthCheckIntervalSeconds: 15
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: fixed-response
+          FixedResponseConfig:
+            StatusCode: '403'
+            ContentType: text/plain
+            MessageBody: Access denied
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  VerifiedOriginRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 1
+      Conditions:
+        - Field: http-header
+          HttpHeaderConfig:
+            HttpHeaderName: X-Scram-Origin
+            Values:
+              - !Ref OriginVerifyHeader
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref WebTargetGroup
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '1024'
+      Memory: '2048'
+      RuntimePlatform:
+        CpuArchitecture: !Ref TaskArchitecture
+        OperatingSystemFamily: LINUX
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !GetAtt TaskRole.Arn
+      ContainerDefinitions:
+        - Name: api
+          Image: !Ref ApiImage
+          Essential: true
+          StopTimeout: 120
+          Environment:
+            - Name: SCRAM_MODEL_PROVIDER
+              Value: bedrock
+            - Name: AWS_REGION
+              Value: us-west-2
+            - Name: BEDROCK_MODEL_ID
+              Value: us.amazon.nova-lite-v1:0
+            - Name: SCRAM_EXECUTOR
+              Value: local
+            - Name: SURREAL_URL
+              Value: mem://
+            - Name: SCRAM_TRACE_MODE
+              Value: local
+            - Name: PYTHON_DOTENV_DISABLED
+              Value: '1'
+          HealthCheck:
+            Command:
+              - CMD
+              - python
+              - -c
+              - "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=4))['sandbox_ready']"
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 180
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ContainerLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: api
+        - Name: web
+          Image: !Ref WebImage
+          Essential: true
+          StopTimeout: 120
+          DependsOn:
+            - ContainerName: api
+              Condition: HEALTHY
+          Environment:
+            - Name: API_UPSTREAM
+              Value: http://127.0.0.1:8000
+          PortMappings:
+            - ContainerPort: 8080
+              Protocol: tcp
+          HealthCheck:
+            Command: [CMD-SHELL, 'wget -q -O /dev/null http://127.0.0.1:8080/healthz || exit 1']
+            Interval: 15
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 10
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref ContainerLogs
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: web
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: VerifiedOriginRule
+    Properties:
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref TaskDefinition
+      LaunchType: FARGATE
+      PlatformVersion: LATEST
+      DesiredCount: 1
+      DeploymentConfiguration:
+        MinimumHealthyPercent: 0
+        MaximumPercent: 100
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      HealthCheckGracePeriodSeconds: 240
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref PublicSubnetIds
+          SecurityGroups:
+            - !Ref TaskSecurityGroup
+      LoadBalancers:
+        - ContainerName: web
+          ContainerPort: 8080
+          TargetGroupArn: !Ref WebTargetGroup
+      EnableECSManagedTags: true
+      PropagateTags: SERVICE
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  PresenterAccess:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Join ['-', [scram-presenter, !Select [2, !Split ['/', !Ref AWS::StackId]]]]
+      AutoPublish: true
+      FunctionConfig:
+        Comment: Allow the event presenter public IPv4 address only.
+        Runtime: cloudfront-js-2.0
+      FunctionCode: !Sub |
+        function handler(event) {
+            if (event.viewer.ip !== '${AllowedViewerIp}') {
+                return {
+                    statusCode: 403,
+                    statusDescription: 'Forbidden',
+                    headers: {
+                        'cache-control': { value: 'no-store' },
+                        'content-type': { value: 'text/plain; charset=utf-8' }
+                    },
+                    body: 'Access denied'
+                };
+            }
+            return event.request;
+        }
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        IPV6Enabled: false
+        Comment: SCRAM event presenter demo.
+        PriceClass: PriceClass_100
+        HttpVersion: http2
+        Origins:
+          - Id: ScramALB
+            DomainName: !GetAtt LoadBalancer.DNSName
+            CustomOriginConfig:
+              HTTPPort: 80
+              OriginProtocolPolicy: http-only
+              OriginReadTimeout: 60
+            OriginCustomHeaders:
+              - HeaderName: X-Scram-Origin
+                HeaderValue: !Ref OriginVerifyHeader
+        DefaultCacheBehavior:
+          TargetOriginId: ScramALB
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD, OPTIONS, PUT, PATCH, POST, DELETE]
+          CachedMethods: [GET, HEAD]
+          Compress: true
+          # AWS-managed CachingDisabled and AllViewerExceptHostHeader policies.
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          OriginRequestPolicyId: b689b0a8-53d0-40ab-baf2-68738e2966ac
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt PresenterAccess.FunctionMetadata.FunctionARN
+        CustomErrorResponses:
+          - ErrorCode: 400
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 403
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 405
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 414
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 416
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 500
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 501
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 502
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 503
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 504
+            ErrorCachingMinTTL: 0
+        ViewerCertificate:
+          CloudFrontDefaultCertificate: true
+      Tags:
+        - Key: Project
+          Value: SCRAM
+        - Key: Event
+          Value: HackSprint-2026-10-16
+
+Outputs:
+  HttpsUrl:
+    Description: Presenter-restricted SCRAM HTTPS endpoint.
+    Value: !Sub https://${Distribution.DomainName}
+  ClusterName:
+    Value: !Ref Cluster
+  ServiceName:
+    Value: !GetAtt Service.Name
+  LogGroupName:
+    Value: !Ref ContainerLogs
+  DistributionId:
+    Value: !Ref Distribution
+  ApiImageUri:
+    Value: !Ref ApiImage
+  WebImageUri:
+    Value: !Ref WebImage
