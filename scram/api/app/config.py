@@ -22,6 +22,11 @@ def _env(name: str, default: str = "") -> str:
 API_DIR = Path(__file__).resolve().parents[1]
 FIXTURES = API_DIR.parent / "web" / "src" / "fixtures"  # one source of truth, shared with the front end
 
+# Daytona — sandbox that runs the approved action
+DAYTONA_API_KEY = _env("DAYTONA_API_KEY")
+DAYTONA_API_URL = _env("DAYTONA_API_URL")
+DAYTONA_TARGET = _env("DAYTONA_TARGET")
+
 # Arize AX — traces and evaluators
 ARIZE_SPACE_ID = _env("ARIZE_SPACE_ID")
 ARIZE_API_KEY = _env("ARIZE_API_KEY")

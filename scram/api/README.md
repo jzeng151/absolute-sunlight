@@ -29,6 +29,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 
 | Tool | Job in SCRAM | Where | Without a key |
 |---|---|---|---|
+| **Daytona** | The simulated reactor's state lives in a sandbox. Checkpoint, execute (with the fault), verify and rollback all run as code inside it. | `app/adapters/sandbox.py` | Local sandbox, same interface |
 | **Arize AX** | One trace per run: normalize → policy → approval → checkpoint → execute → verify → rollback → audit. The four evaluator results are attached to the root span as `eval.*` attributes. | `app/adapters/trace.py` | No-op tracer; in-app trace still shows |
 
 ## Endpoints
