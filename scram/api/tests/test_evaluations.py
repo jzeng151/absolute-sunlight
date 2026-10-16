@@ -265,3 +265,50 @@ def test_approval_inapplicability_requires_valid_policy_evidence(suite, mutation
     else:
         run.events = [replace(e, outcome="error") if e.step == "policy" else e for e in run.events]
     assert labels(run)["Approval integrity"] == "INCOMPLETE"
+
+
+@pytest.mark.parametrize("case,reasons", [
+    ("C2", ["APPROVAL_EXPIRED"]), ("C2", ["HASH_MISMATCH"]),
+    ("C4", []), ("C4", ["HASH_MISMATCH"]),
+    ("C4", ["HASH_MISMATCH", "APPROVAL_ALREADY_USED", "APPROVAL_EXPIRED"]),
+])
+def test_contradictory_approval_reasons_never_pass(suite, case, reasons):
+    run = suite[case]
+    data(run, "approval.check")["reason_codes"] = reasons
+    assert labels(run)["Approval integrity"] == "FAIL"
+
+
+def test_rejection_without_artifact_requires_derived_reasons(engine):
+    v = engine.create_run("C2")
+    engine.runs[v["run_id"]]["approval_expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    approve(engine, v)
+    observed = engine.traces[v["run_id"]].evidence
+    assert labels(observed)["Approval integrity"] == "PASS"
+    data(observed, "approval.check")["reason_codes"] = []
+    assert labels(observed)["Approval integrity"] == "FAIL"
+
+
+@pytest.mark.parametrize("field", ["rule_ids", "policy_version"])
+@pytest.mark.parametrize("step", ["rule.retrieve", "policy"])
+def test_mismatched_policy_authority_fails_trajectory(suite, field, step):
+    run = suite["C2"]
+    data(run, step)[field] = ["different-rule"] if field == "rule_ids" else "different-version"
+    assert labels(run)["Trajectory order"] == "FAIL"
+
+
+@pytest.mark.parametrize("mutation", ["missing_version", "empty_rules", "failed_retrieval"])
+def test_incomplete_policy_authority_is_not_a_pass(suite, mutation):
+    run = suite["C2"]
+    if mutation == "missing_version":
+        del data(run, "policy")["policy_version"]
+    elif mutation == "empty_rules":
+        data(run, "rule.retrieve")["rule_ids"] = []
+    else:
+        run.events = [replace(e, outcome="error") if e.step == "rule.retrieve" else e for e in run.events]
+    assert labels(run)["Trajectory order"] == "INCOMPLETE"
+
+
+def test_empty_read_states_cannot_prove_safe_read(suite):
+    run = suite["C1"]
+    data(run, "read").update(state_before={}, state_after={})
+    assert labels(run)["Trajectory order"] == "INCOMPLETE"

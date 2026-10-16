@@ -12,7 +12,7 @@ CONTRACT_VERSION = "1"
 REQUIRED_FIELDS = {
     "normalize": {"action", "action_hash", "intent"},
     "rule.retrieve": {"rule_ids", "policy_version"},
-    "policy": {"state", "reason_code", "approval_required"},
+    "policy": {"state", "reason_code", "approval_required", "rule_ids", "policy_version"},
     "approval": {"approval_id", "actor_id", "run_id", "action_hash", "issued_at", "expires_at", "decision"},
     "approval.check": {"approval_id", "actor_id", "presented_hash", "checked_at", "used_before", "consumed", "valid", "reason_codes"},
     "checkpoint": {"checkpoint_id", "state", "checksum"},

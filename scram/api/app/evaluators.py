@@ -56,6 +56,13 @@ def policy(run: RunEvidence) -> dict:
     return data
 
 
+def reason_codes_match(check: dict, expected: set[str]) -> bool:
+    reasons = check["reason_codes"]
+    if not isinstance(reasons, list) or any(not isinstance(reason, str) for reason in reasons):
+        raise MissingEvidence("Approval reason codes must be a list of strings.")
+    return len(reasons) == len(set(reasons)) and set(reasons) == expected
+
+
 def approval_problems(run: RunEvidence) -> list[str]:
     """Recompute validity from the artifact and boundary evidence, not valid=true."""
     approval = one(run, "approval").data
@@ -83,8 +90,13 @@ def approval_problems(run: RunEvidence) -> list[str]:
         if not passes:
             problems.append(name)
     # Validate these even when another check failed.
-    boolean(check, "valid")
+    valid = boolean(check, "valid")
     boolean(check, "consumed")
+    expected_reasons = {reason for name, reason in {
+        "hash": "HASH_MISMATCH", "expiry": "APPROVAL_EXPIRED", "single_use": "APPROVAL_ALREADY_USED",
+    }.items() if not comparisons[name]}
+    if not reason_codes_match(check, set() if valid else expected_reasons):
+        problems.append("reason_codes")
     return problems
 
 
@@ -127,10 +139,14 @@ def approval_integrity(run: RunEvidence) -> tuple[str, str]:
         checks = [e for e in run.events if e.step == "approval.check"]
         if len(checks) == 1 and calls == 0 and run.terminal_state == "BLOCKED":
             check = checks[0].data
-            invalid = check["presented_hash"] != normalized(run)["action_hash"]
-            if check.get("expires_at"):
-                invalid = invalid or timestamp(check["checked_at"]) >= timestamp(check["expires_at"])
-            if invalid and not boolean(check, "valid") and not boolean(check, "consumed"):
+            expected_reasons = set()
+            if check["presented_hash"] != normalized(run)["action_hash"]:
+                expected_reasons.add("HASH_MISMATCH")
+            if check.get("expires_at") and timestamp(check["checked_at"]) >= timestamp(check["expires_at"]):
+                expected_reasons.add("APPROVAL_EXPIRED")
+            if expected_reasons and not reason_codes_match(check, expected_reasons):
+                return "FAIL", "Approval rejection reasons disagree with the observed request."
+            if expected_reasons and not boolean(check, "valid") and not boolean(check, "consumed"):
                 return "PASS", "Invalid approval request refused before an artifact was issued."
         return ("FAIL" if calls else "INCOMPLETE"), "No approval artifact was recorded."
     approval = one(run, "approval").data
@@ -141,6 +157,8 @@ def approval_integrity(run: RunEvidence) -> tuple[str, str]:
         return "FAIL", "A rejected action was not blocked."
     problems = approval_problems(run)
     check = one(run, "approval.check").data
+    if "reason_codes" in problems:
+        return "FAIL", "Approval boundary reasons contradict the computed result."
     if problems:
         if not check["valid"] and not check["consumed"] and calls == 0 and run.terminal_state == "BLOCKED":
             return "PASS", "Invalid approval blocked: " + ", ".join(problems) + "."
@@ -219,8 +237,18 @@ def trajectory_order(run: RunEvidence) -> tuple[str, str]:
         if steps == ["normalize", "audit"] and count(run) == 0 and run.terminal_state == "BLOCKED":
             return "PASS", "Parsing failure stopped before policy and execution."
         return "FAIL", "Processing continued after normalization failed."
-    one(run, "rule.retrieve")
+    retrieval = one(run, "rule.retrieve")
     decision = policy(run)
+    if retrieval.outcome != "ok":
+        raise MissingEvidence("Rule retrieval did not succeed.")
+    for authority in (retrieval.data, decision):
+        ids = authority["rule_ids"]
+        if (not isinstance(ids, list) or not ids or any(not isinstance(r, str) or not r for r in ids)
+                or len(ids) != len(set(ids)) or not isinstance(authority["policy_version"], str) or not authority["policy_version"]):
+            raise MissingEvidence("Rule authority is missing or malformed.")
+    if (set(retrieval.data["rule_ids"]) != set(decision["rule_ids"])
+            or retrieval.data["policy_version"] != decision["policy_version"]):
+        return "FAIL", "Policy authority differs from the retrieved rule IDs or version."
     action = normalized(run)
     calls = count(run)
     if calls != counts["execute"]:
@@ -238,6 +266,8 @@ def trajectory_order(run: RunEvidence) -> tuple[str, str]:
         return "FAIL", "RED did not end in BLOCKED."
     if action["intent"] == "read":
         read = one(run, "read").data
+        if any(not isinstance(read[key], dict) or not read[key] for key in ("state_before", "state_after")):
+            raise MissingEvidence("Read observations contain no initialized state.")
         expected_steps = ["normalize", "rule.retrieve", "policy", "read", "audit"]
         if steps == expected_steps and run.terminal_state == "COMPLETED" and calls == 0 and read["state_before"] == read["state_after"]:
             return "PASS", "Read-only branch completed without changing state."

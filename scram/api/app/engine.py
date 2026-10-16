@@ -13,6 +13,7 @@ import logging
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from typing import Any
 
 from . import config, core
@@ -50,9 +51,21 @@ def _span(name: str, status: str, detail: str = "") -> dict[str, str]:
     return {"name": name, "status": status, "detail": detail}
 
 
+def accepting_work(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self.lock:
+            if self.closed:
+                raise ForbiddenTransition("engine is shutting down")
+            return method(self, *args, **kwargs)
+    return call
+
+
 class Engine:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self.closed = False
+        self._workers: set[threading.Thread] = set()
         self.store = make_store()
         self.store.seed_rules(core.RULEBOOK)
         self.sandbox = make_sandbox()
@@ -63,7 +76,8 @@ class Engine:
         self.used_approval_hashes: set[str] = set()
         self.output = core.REACTOR["output_percent"]
         self.sandbox_ready = threading.Event()
-        threading.Thread(target=self._init_sandbox, daemon=True).start()
+        self._initializer = threading.Thread(target=self._init_sandbox, daemon=True)
+        self._initializer.start()
 
     # ---------- setup ----------
 
@@ -131,6 +145,7 @@ class Engine:
 
     # ---------- endpoints ----------
 
+    @accepting_work
     def create_run(self, case_id: str) -> dict[str, Any]:
         if case_id not in core.CASES:
             raise NotFound(case_id)
@@ -173,6 +188,8 @@ class Engine:
             # Independently observe the read-only branch. Failure to observe is not proof of no mutation.
             read_evidence, read_outcome = {}, "ok"
             try:
+                if not self.sandbox_ready.wait(timeout=180):
+                    raise TimeoutError("sandbox initialization is still pending")
                 read_evidence = {"state_before": self.sandbox.read_state(), "state_after": self.sandbox.read_state()}
             except Exception as error:
                 read_evidence, read_outcome = {"error_type": type(error).__name__}, "error"
@@ -219,6 +236,7 @@ class Engine:
         run["trace_spans"].append(_span("approval", "running", "waiting"))
         return self.view(run)
 
+    @accepting_work
     def reject(self, run_id: str) -> dict[str, Any]:
         run = self._get(run_id)
         if run["machine_state"] != "AWAITING_APPROVAL":
@@ -235,23 +253,26 @@ class Engine:
         self._finish(run)
         return self.view(run)
 
+    @accepting_work
     def approve(self, run_id: str, actor_id: str, presented_hash: str | None) -> dict[str, Any]:
         run = self._get(run_id)
         if run["machine_state"] != "AWAITING_APPROVAL":
             raise ForbiddenTransition("run is not awaiting approval")
         tr = self.traces[run_id]
         expected = run["action"]["action_hash"]
-        expired = _now() >= datetime.fromisoformat(run["approval_expires_at"])
+        checked_at = _now()
+        expired = checked_at >= datetime.fromisoformat(run["approval_expires_at"])
         if presented_hash != expected or expired:
+            reasons = (["HASH_MISMATCH"] if presented_hash != expected else []) + (["APPROVAL_EXPIRED"] if expired else [])
             reason = "APPROVAL_EXPIRED" if expired else "HASH_MISMATCH"
             self._move(run, "BLOCKED")
-            run["block_reasons"] = [reason]
+            run["block_reasons"] = reasons
             run["approved_hash"] = presented_hash
             tr.step("approval.check", "GUARDRAIL", ok=False, outcome="blocked", evidence={
                 "approval_id": "", "actor_id": actor_id, "presented_hash": presented_hash,
-                "checked_at": _now().isoformat(), "expires_at": run["approval_expires_at"],
-                "used_before": False, "consumed": False, "valid": False, "reason_codes": [reason],
-            }, **{"scram.reason": reason})
+                "checked_at": checked_at.isoformat(), "expires_at": run["approval_expires_at"],
+                "used_before": False, "consumed": False, "valid": False, "reason_codes": reasons,
+            }, started_at=checked_at.timestamp(), ended_at=checked_at.timestamp(), **{"scram.reason": reason})
             run["trace_spans"][-1] = _span("approval", "error", reason.lower())
             run["trace_spans"].append(_span("audit", "ok", "recorded"))
             self._finish(run)
@@ -266,7 +287,9 @@ class Engine:
         run["trace_spans"] += [_span("checkpoint", "running"), _span("execute", "pending"), _span("verify", "pending")]
         run["voice_line"] = others.VOICE_LINES["approved"]
         self._move(run, "CHECKPOINTING")
-        threading.Thread(target=self._execute, args=(run, self.fault), daemon=True).start()
+        worker = threading.Thread(target=self._execute_worker, args=(run, self.fault), daemon=True)
+        self._workers.add(worker)
+        worker.start()
         return self.view(run)
 
     def get(self, run_id: str) -> dict[str, Any]:
@@ -282,6 +305,13 @@ class Engine:
 
     # ---------- execution (background) ----------
 
+    def _execute_worker(self, run: dict, fault: bool) -> None:
+        try:
+            self._execute(run, fault)
+        finally:
+            with self.lock:
+                self._workers.discard(threading.current_thread())
+
     def _set_span(self, run: dict, name: str, status: str, detail: str = "") -> None:
         for i, s in enumerate(run["trace_spans"]):
             if s["name"] == name:
@@ -289,14 +319,40 @@ class Engine:
                 return
         run["trace_spans"].append(_span(name, status, detail))
 
+    def _approval_at_dispatch(self, run: dict, tr: trace.RunTrace) -> dict:
+        checked_at = _now()
+        hash_matches = run["approval"]["action_hash"] == run["action"]["action_hash"]
+        expired = checked_at >= datetime.fromisoformat(run["approval"]["expires_at"])
+        reasons = (["HASH_MISMATCH"] if not hash_matches else []) + (["APPROVAL_EXPIRED"] if expired else [])
+        valid = not reasons
+        check = {
+            "approval_id": run["approval"]["approval_id"], "actor_id": run["approval"]["actor_id"],
+            "presented_hash": run["action"]["action_hash"], "checked_at": checked_at.isoformat(),
+            "used_before": run["_approval_used_before"], "consumed": valid,
+            "valid": valid, "reason_codes": reasons,
+        }
+        if not valid:
+            run["block_reasons"] = reasons
+            self.store.save_approval(run["approval"])  # Release the unused reservation.
+            tr.step("approval.check", "GUARDRAIL", ok=False, outcome="blocked", evidence=check,
+                    started_at=checked_at.timestamp(), ended_at=checked_at.timestamp())
+            self._set_span(run, "approval", "error", ", ".join(reasons))
+            self._set_span(run, "execute", "skipped", "invalid approval")
+            self._set_span(run, "verify", "skipped", "no execution")
+            raise ForbiddenTransition("approval invalid before execution")
+        run["approval"]["used"] = True
+        self.used_approval_hashes.add(run["approval"]["action_hash"])
+        return check
+
     def _execute(self, run: dict, fault: bool) -> None:
         tr = self.traces[run["run_id"]]
         expected = run["action"]["expected_postcondition"]["output_percent"]
         delta = run["action"]["normalized_parameters"]["delta_percent"]
-        self.sandbox_ready.wait(timeout=180)
         wrote = False
         before: dict[str, Any] = {}
         try:
+            if not self.sandbox_ready.wait(timeout=180):
+                raise TimeoutError("sandbox initialization is still pending")
             # Checkpoint: read the state inside the sandbox and store the copy.
             t = time.time()
             before = self.sandbox.read_state()
@@ -307,34 +363,16 @@ class Engine:
             self._set_span(run, "checkpoint", "ok", cp["checkpoint_id"])
             self._pace(t)
 
-            # Check the actual approval window after checkpointing, before dispatch.
-            checked_at = _now()
-            hash_matches = run["approval"]["action_hash"] == run["action"]["action_hash"]
-            expired = checked_at >= datetime.fromisoformat(run["approval"]["expires_at"])
-            reasons = (["HASH_MISMATCH"] if not hash_matches else []) + (["APPROVAL_EXPIRED"] if expired else [])
-            valid = not reasons
-            if valid:
-                run["approval"]["used"] = True
-                self.store.save_approval(run["approval"])
-                self.used_approval_hashes.add(run["approval"]["action_hash"])
-            tr.step("approval.check", "GUARDRAIL", ok=valid, outcome="ok" if valid else "blocked", evidence={
-                "approval_id": run["approval"]["approval_id"], "actor_id": run["approval"]["actor_id"],
-                "presented_hash": run["action"]["action_hash"], "checked_at": checked_at.isoformat(),
-                "used_before": run["_approval_used_before"], "consumed": run["approval"]["used"],
-                "valid": valid, "reason_codes": reasons,
-            })
-            if not valid:
-                run["block_reasons"] = reasons
-                self._set_span(run, "approval", "error", ", ".join(reasons))
-                self._set_span(run, "execute", "skipped", "invalid approval")
-                self._set_span(run, "verify", "skipped", "no execution")
-                raise ForbiddenTransition("approval invalid before execution")
+            # Reserve the single-use approval and persist the transition before the
+            # final clock check. Neither storage nor telemetry may intervene after it.
+            self.store.save_approval({**run["approval"], "used": True})
             self._move(run, "EXECUTING")
             self._set_span(run, "execute", "running")
-            t = time.time()
             executed_action = {"tool": "adjust_output", "target": core.REACTOR["target"],
                                "normalized_parameters": {"delta_percent": delta}, "expected_postcondition": {"output_percent": expected}}
-            with tr.execution(executed_action, f"sbx_{self.sandbox.run_id}", fault=fault):
+            t = time.time()
+            with tr.execution(executed_action, f"sbx_{self.sandbox.run_id}", fault=fault,
+                              before_dispatch=lambda: self._approval_at_dispatch(run, tr)):
                 after = self.sandbox.adjust_output(delta, fault)
             wrote = True
             self.output = after["output_percent"]
@@ -412,6 +450,20 @@ class Engine:
     def set_fault(self, enabled: bool) -> None:
         self.fault = bool(enabled)
 
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+            workers = list(self._workers)
+        # Keep traces writable until execution, verification, and recovery settle.
+        # Joining outside the lock lets each worker finish and unregister itself.
+        for worker in workers:
+            worker.join()
+        self._initializer.join()
+        with self.lock:
+            for tr in self.traces.values():
+                tr.close("SHUTDOWN")
+
+    @accepting_work
     def reset(self) -> None:
         with self.lock:
             for tr in self.traces.values():

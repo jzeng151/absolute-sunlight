@@ -78,13 +78,18 @@ The Audit view shows the label and explanation, and waits for evaluations after 
 `GET /api/runs/{id}/evidence` returns `export_status`: `local`, `recording`, `queued`,
 `uploading`, `waiting_for_span`, `evaluations_submitted`, or `error:<type>`. Submission does not prove AX indexing; confirm
 the trace and evaluation columns in AX. An outage or full queue preserves local results.
-Shutdown waits up to two seconds for the queue. The pinned SDK does not expose a Flight
+Shutdown rejects new work and waits for active execution, verification, recovery, and sandbox
+initialization before closing pending traces. A blocked control adapter can extend that wait.
+It then waits up to two seconds for the upload queue. The pinned SDK does not expose a Flight
 request deadline, so a stalled request can occupy the daemon worker until it returns;
 the queue remains bounded and control execution continues. Shutdown can lose pending uploads.
 
 See [the evidence contract](../../docs/SCRAM_ARIZE_EVENT_CONTRACT.md) for backend hooks.
 Evaluators observe existing control behavior. This integration also rejects approval expiry
-at the execution boundary, after checkpointing; an approval is consumed only when that
-check succeeds. It does not fix the core's uncertain-write recovery, reset coordination,
+at the execution boundary, after checkpointing, storage, and trace preparation; an approval
+is consumed only when that check succeeds. Approval evidence is exported after dispatch
+so slow telemetry cannot consume the approval window. Evaluators check rejection reasons
+and correlate the retrieved rule IDs and policy version with the decision. GREEN reads
+wait for sandbox readiness. This integration does not fix the core's uncertain-write recovery, reset coordination,
 or write-lock enforcement. An executor timeout after a write therefore produces
 missing-recovery evidence rather than four passing evaluations.

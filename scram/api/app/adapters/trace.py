@@ -15,7 +15,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Any
+from typing import Any, Callable
 
 from opentelemetry import trace
 from opentelemetry.trace import Status, StatusCode
@@ -105,11 +105,12 @@ class RunTrace:
         self.results: list[dict] = []
 
     def step(self, name: str, kind: str, ok: bool = True, *, evidence: dict | None = None,
-             outcome: str | None = None, started_at: float | None = None, **attrs: Any) -> None:
+             outcome: str | None = None, started_at: float | None = None,
+             ended_at: float | None = None, **attrs: Any) -> None:
         with self.lock:
             if self.closed:
                 return
-            ended = utc_now()
+            ended = datetime.fromtimestamp(ended_at, timezone.utc).isoformat() if ended_at is not None else utc_now()
             started = datetime.fromtimestamp(started_at, timezone.utc).isoformat() if started_at is not None else ended
             outcome = outcome or ("ok" if ok else "failed")
             data = None
@@ -140,13 +141,17 @@ class RunTrace:
                 self.evidence.events.append(StepEvent(len(self.evidence.events) + 1, name, started, ended, outcome, data, span_id))
 
     @contextmanager
-    def execution(self, action: dict, executor_run_id: str, *, fault: bool):
+    def execution(self, action: dict, executor_run_id: str, *, fault: bool,
+                  before_dispatch: Callable[[], dict] | None = None):
         from ..evidence import action_hash
         from time import time
 
-        with self.lock:
-            self.evidence.executor_call_count += 1
         data = {"action": deepcopy(action), "action_hash": action_hash(action), "executor_run_id": executor_run_id}
+        with self.lock:
+            # Acquire the evidence lock and prepare data before the engine's final
+            # guard; no exporting or hashing may delay dispatch after it succeeds.
+            approval_check = before_dispatch() if before_dispatch is not None else None
+            self.evidence.executor_call_count += 1
         started, outcome = time(), "ok"
         try:
             yield
@@ -155,7 +160,14 @@ class RunTrace:
             data["error_type"] = type(error).__name__
             raise
         finally:
-            self.step("execute", "TOOL", ok=outcome == "ok", outcome=outcome, started_at=started, evidence=data,
+            ended = time()
+            # Export the captured boundary only after the call, so slow telemetry
+            # cannot consume the remaining approval window before dispatch.
+            if approval_check is not None:
+                checked = datetime.fromisoformat(approval_check["checked_at"]).timestamp()
+                self.step("approval.check", "GUARDRAIL", evidence=approval_check,
+                          started_at=checked, ended_at=checked)
+            self.step("execute", "TOOL", ok=outcome == "ok", outcome=outcome, started_at=started, ended_at=ended, evidence=data,
                       **{"tool.name": action["tool"], "scram.fault_injected": fault})
 
     def evaluate(self, final_state: str) -> list[dict]:

@@ -19,10 +19,11 @@ engine = Engine()
 
 @asynccontextmanager
 async def lifespan(app):
-    yield
-    for tr in list(engine.traces.values()):
-        tr.close("SHUTDOWN")
-    await to_thread(trace.shutdown)
+    try:
+        yield
+    finally:
+        await to_thread(engine.close)
+        await to_thread(trace.shutdown)
 
 
 app = FastAPI(title="SCRAM", version="0.3", lifespan=lifespan)
