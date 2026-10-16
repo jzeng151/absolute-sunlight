@@ -63,7 +63,7 @@ Expected outcomes for an unprotected agent on the same five cases (illustrative,
 - **State machine:** IDLE → PARSING → RULE_RETRIEVED → CLASSIFIED → AWAITING_APPROVAL → CHECKPOINTING → EXECUTING → VERIFYING → COMPLETED, or ROLLING_BACK → RESTORED, then an audit record. Forbidden transitions raise and are logged; nothing reaches EXECUTING without a checkpoint.
 - **Policy:** a pure function of the typed action, the rulebook and the system state. Six rules (NC-01 to NC-06). No model output can set or change the state.
 - **Action hash:** SHA-256 over canonical JSON of tool, target, parameters and expected postcondition. Front end and back end compute it identically. Change one parameter and the approval is void.
-- **Tests:** 22 back-end tests, no keys needed: the policy truth set, RED never executing, fault → verified rollback, wrong hash, replay after use, an expired approval, low parse confidence, reject then approve, the SurrealDB graph link, the Agent Memory facts, API keys never leaking into URLs, and a contract test that every API response matches the front end's types in every demo state. GitHub Actions runs them plus a type-checked front-end build on every push.
+- **Tests:** [CONFIRM final count after the merge] back-end tests, no keys needed: the policy truth set, RED never executing, fault → verified rollback, wrong hash, replay after use, an expired approval, low parse confidence, reject then approve, the SurrealDB graph link, the Agent Memory facts, API keys never leaking into URLs, and a contract test that every API response matches the front end's types in every demo state. GitHub Actions runs them plus a type-checked front-end build on every push.
 
 ### Safeguards
 
