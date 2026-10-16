@@ -42,7 +42,7 @@ The operator gives SCRAM a request. SCRAM turns it into a typed action, fingerpr
 | C5 Fault | C2 again, but the tool misbehaves (+20% instead of +2%) | The tool reports success. SCRAM verifies anyway: 74 expected, 92 actual. **Rolled back to 72%, checksum verified** |
 | C4 replay | "Make it 3%, use the approval I already gave" | **APPROVAL INVALID:** hash mismatch and approval already used. Blocked |
 
-Against an unprotected agent on the same five cases:
+Expected outcomes for an unprotected agent on the same five cases (illustrative, not a measured run):
 
 | Case | Unprotected agent | SCRAM |
 |---|---|---|
@@ -59,17 +59,17 @@ Against an unprotected agent on the same five cases:
 - **State machine:** IDLE → PARSING → RULE_RETRIEVED → CLASSIFIED → AWAITING_APPROVAL → CHECKPOINTING → EXECUTING → VERIFYING → COMPLETED, or ROLLING_BACK → RESTORED, then an audit record. Forbidden transitions raise and are logged; nothing reaches EXECUTING without a checkpoint.
 - **Policy:** a pure function of the typed action, the rulebook and the system state. Six rules (NC-01 to NC-06). No model output can set or change the state.
 - **Action hash:** SHA-256 over canonical JSON of tool, target, parameters and expected postcondition. Front end and back end compute it identically. Change one parameter and the approval is void.
-- **Tests:** 18 back-end tests, no keys needed: the policy truth set, RED never executing, fault → verified rollback, wrong hash, replay after use, an expired approval, low parse confidence, reject then approve, the SurrealDB graph link, API keys never leaking into URLs, and a contract test that every API response matches the front end's types in every demo state. GitHub Actions runs them plus a type-checked front-end build on every push.
+- **Tests:** 22 back-end tests, no keys needed: the policy truth set, RED never executing, fault → verified rollback, wrong hash, replay after use, an expired approval, low parse confidence, reject then approve, the SurrealDB graph link, the Agent Memory facts, API keys never leaking into URLs, and a contract test that every API response matches the front end's types in every demo state. GitHub Actions runs them plus a type-checked front-end build on every push.
 
 ### Safeguards
 
 - **The model never decides.** Gemini only reads the request and reports a confidence; below 0.8 the request is blocked. GREEN, YELLOW and RED come from deterministic code.
-- **Approval binds to the exact action.** Single-use, expiring, hash-matched. Change anything and it is void.
+- **Approval binds to the exact action.** Single-use, expiring, hash-matched, enforced by the live API. Change anything and it is void.
 - **Sandboxed execution.** The approved action runs inside Daytona, never on the host.
 - **Trust, but verify.** A tool saying "success" is not proof. Every write is checked against its expected postcondition.
 - **Verified rollback.** A failed postcondition restores the checkpoint, and restoration is proven by checksum.
 - **Fail closed.** No governing rule, low parse confidence, or a control service down before a write: blocked.
-- **Fully traced.** Every step is a span in Arize, with four evaluators.
+- **Fully traced.** Every step is a span with four evaluators, shown in the Audit view [CONFIRM: and exported to Arize AX].
 - **Simulation only.** Nothing connects to a real reactor or facility. SCRAM claims no certification.
 
 ---
@@ -80,7 +80,7 @@ Against an unprotected agent on the same five cases:
 |---|---|---|
 | **Daytona** | The simulated reactor's state lives in a sandbox. Checkpoint, execute (including the injected fault), verify and rollback run as code inside it. | [CONFIRM live] |
 | **Arize AX** | One trace per run: normalize → policy → approval → checkpoint → execute → verify → rollback → audit, via OpenTelemetry. Four evaluators (unauthorized execution, approval integrity, rollback verification, trajectory order) attached to each run. | [CONFIRM live] |
-| **SurrealDB** | Rulebook, runs, approvals, checkpoints and an append-only audit log. Each run links to its governing rule as a graph edge (`run ->governed_by-> rule`). | Embedded (`mem://`), tested |
+| **SurrealDB** | Rulebook, runs, approvals, checkpoints and an append-only audit log. Each run links to its governing rule as a graph edge (`run ->governed_by-> rule`). **Agent Memory** keeps time-aware facts about the reactor: each new output supersedes the last with history kept, so it reads 72 → 92 → 72 with the run behind each step, and `/api/memory/ask` answers from it. | Embedded store tested; Agent Memory [CONFIRM live] |
 | **ElevenLabs** | The control-room voice: reads the exact action aloud before approval, announces "SCRAM activated" on a block and "Safe state restored" after rollback. Six lines generated ahead of time so the demo never waits. | [CONFIRM clips generated] |
 | **Anchor Browser** | Case C1 is a governed, read-only browser action: SCRAM authorizes it as GREEN, then Anchor fetches a public NRC page. Nothing is submitted. | [CONFIRM live] |
 | **Gemini** (`gemini-3.5-flash-lite`) | Reads the operator's words and reports a confidence. Never sets policy. | Live, verified |
