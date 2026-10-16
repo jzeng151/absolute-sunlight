@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 import { shortHash } from '../api/hash';
 import type { RunView } from '../types';
-import { formatParams, ladder, stateColor, type Mode } from './derive';
+import { blockedDetail, formatParams, ladder, stateColor, type Mode } from './derive';
 import { VoiceCard } from './VoiceCard';
 import { CodexDrawing, MirrorNote } from './CodexDrawing';
 
@@ -96,8 +96,8 @@ export function ControlZone({ run, mode, caseLabel, busy, onRun, onApprove, onRe
           <p className="state-sub">Action blocked before execution</p>
           <Cells
             items={[
-              ['Reason', run!.decision!.reason_code],
-              ['Violated', `${expected} % > ceiling 80 %`],
+              ['Reason', blockedDetail(run!).reason],
+              ['Constraint', blockedDetail(run!).detail],
               ['Executor calls', '0', 'var(--scram-red)']
             ]}
           />

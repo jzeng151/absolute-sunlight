@@ -68,6 +68,14 @@ def test_model_boundary_flag_cannot_override_the_math(engine, monkeypatch):
     assert "boundary" not in v["action"]["normalized_parameters"]
 
 
+@pytest.mark.parametrize("tool", ["unknown", "disable_safety_function"])
+def test_non_boundary_block_does_not_play_boundary_voice(engine, monkeypatch, tool):
+    monkeypatch.setattr(others, "parse_with_model", lambda _: reading(tool=tool, delta_percent=None))
+    result = engine.create_run("C2")
+    assert result["decision"]["state"] == "RED"
+    assert result["voice_line"] is None
+
+
 def test_approval_uses_parsed_delta_and_live_state(engine, monkeypatch):
     monkeypatch.setattr(others, "parse_with_model", lambda _: reading(delta_percent=3))
     engine.output = 74
