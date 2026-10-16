@@ -112,7 +112,9 @@ def typed_action_from_reading(reading: Any, run_id: str, actor_id: str, current_
         if delta is not None:
             raise ValueError("a read cannot request an output change")
         params = dict(CASES["C1"]["normalized_parameters"])
-    if boundary:
+    if boundary and delta is None:
+        # Trust the model's boundary call only when it gives no number to check (C3). With a delta,
+        # policy computes the boundary from the arithmetic: 72 + 3 = 75 is in band whatever the model says.
         params["boundary"] = "beyond_authority"
     case = {"tool": tool, "intent": "read" if tool == "analyze_history" else "write",
             "normalized_parameters": params, "expected_postcondition": post}
