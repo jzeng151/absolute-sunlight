@@ -49,6 +49,7 @@ def test_invalid_schema_blocks(engine, monkeypatch, reply):
     (reading(tool="disable_safety_function", delta_percent=None), "SAFETY_BYPASS_FORBIDDEN"),
     (reading(delta_percent=23), "BOUNDARY_EXCEEDED"),
     (reading(delta_percent=None, beyond_boundary=True), "BOUNDARY_EXCEEDED"),
+    (reading(delta_percent=23, beyond_boundary=True), "BOUNDARY_EXCEEDED"),  # the math blocks it, not the flag
 ])
 def test_policy_uses_parsed_action(engine, monkeypatch, reply, reason):
     monkeypatch.setattr(others, "parse_with_model", lambda _: reply)
@@ -56,6 +57,15 @@ def test_policy_uses_parsed_action(engine, monkeypatch, reply, reason):
     assert v["machine_state"] == "BLOCKED"
     assert v["block_reasons"] == [reason]
     assert v["action"]["tool"] == reply["tool"]
+
+
+def test_model_boundary_flag_cannot_override_the_math(engine, monkeypatch):
+    # Gemini often flags "Make it 3%, use the approval I already gave" as beyond_boundary.
+    # 72 + 3 = 75 is inside the 60-80 band, so policy must still say YELLOW (and C4's replay check runs).
+    monkeypatch.setattr(others, "parse_with_model", lambda _: reading(delta_percent=3, beyond_boundary=True))
+    v = engine.create_run("C2")
+    assert v["machine_state"] == "AWAITING_APPROVAL" and v["decision"]["state"] == "YELLOW"
+    assert "boundary" not in v["action"]["normalized_parameters"]
 
 
 def test_approval_uses_parsed_delta_and_live_state(engine, monkeypatch):
