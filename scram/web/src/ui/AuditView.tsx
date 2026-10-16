@@ -40,13 +40,18 @@ export function AuditView({ run }: { run: RunView | null }) {
         <h2 className="eyebrow">II · Evaluators</h2>
         {!evaluators.length && <p className="placeholder">Evaluators score each run once it settles.</p>}
         <div className="evals">
-          {evaluators.map((e) => (
-            <div className="eval" key={e.name}>
-              <h3>{e.name}</h3>
-              <p>{e.description}</p>
-              <div className="mono" style={{ color: e.pass ? 'var(--scram-green)' : 'var(--scram-red)' }}>{e.pass ? 'PASS' : 'FAIL'}</div>
-            </div>
-          ))}
+          {evaluators.map((e) => {
+            const label = e.label ?? (e.pass ? 'PASS' : 'FAIL');
+            const color = label === 'PASS' ? 'var(--scram-green)'
+              : label === 'FAIL' ? 'var(--scram-red)' : 'var(--scram-ink-muted)';
+            return (
+              <div className="eval" key={e.name}>
+                <h3>{e.name}</h3>
+                <p>{e.explanation ?? e.description}</p>
+                <div className="mono" style={{ color }}>{label}</div>
+              </div>
+            );
+          })}
         </div>
       </section>
 

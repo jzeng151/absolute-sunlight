@@ -12,6 +12,33 @@ export const C = {
 
 export const REACTOR = casesFile.reactor;
 
+export function blockedDetail(run: RunView): { reason: string; detail: string } {
+  const reason = run.block_reasons[0] ?? run.decision?.reason_code ?? 'CONTROL_UNAVAILABLE';
+  if (reason === 'BOUNDARY_EXCEEDED') {
+    const expected = Number(run.action?.expected_postcondition.output_percent);
+    const detail = expected > REACTOR.band_max ? `${expected} % > ceiling ${REACTOR.band_max} %`
+      : expected < REACTOR.band_min ? `${expected} % < floor ${REACTOR.band_min} %`
+      : 'The requested action exceeds the authorized operating boundary.';
+    return { reason, detail };
+  }
+  const details: Record<string, string> = {
+    SAFETY_BYPASS_FORBIDDEN: 'Safety functions must remain enabled.',
+    NO_AUTHORITY: 'No rule authorizes this action.',
+    PARSE_UNCERTAIN: 'The requested action could not be determined reliably.',
+    CONTROL_UNAVAILABLE: 'A required control is unavailable.',
+    STATE_CHANGED: 'Reactor state changed. Request a fresh approval.',
+    APPROVAL_EXPIRED: 'Approval expired before execution.',
+    ROLLBACK_FAILED: 'Recovery could not be verified. Operator reset required.'
+  };
+  return { reason, detail: details[reason] ?? 'The action did not satisfy its authorization requirements.' };
+}
+
+export function lockCause(run: RunView): string {
+  if (run.block_reasons.includes('ROLLBACK_FAILED')) return 'Recovery failed';
+  if (run.block_reasons.includes('CONTROL_UNAVAILABLE')) return 'Audit unavailable';
+  return 'Writes locked';
+}
+
 export type Mode = 'idle' | 'green' | 'red' | 'yellow' | 'exec' | 'restored' | 'completed' | 'rejected' | 'replay' | 'locked';
 
 export function modeOf(run: RunView | null): Mode {
@@ -136,7 +163,10 @@ export function footer(run: RunView | null, mode: Mode): FooterItem[] {
   else if (ms === 'ROLLING_BACK') items.push(active('ROLLBACK', C.red));
   else items.push(off('ROLLBACK'));
   const settled = ['green', 'red', 'replay', 'rejected', 'restored', 'completed', 'locked'].includes(mode);
-  items.push(settled ? done('AUDITED') : off('AUDITED'));
+  const audit = run.trace_spans.find(s => s.name === 'audit');
+  items.push(audit?.status === 'ok' ? done('AUDITED')
+    : audit?.status === 'error' ? done('AUDIT FAILED', C.red)
+    : settled ? active('AUDIT PENDING', C.yellow) : off('AUDITED'));
   return items;
 }
 
@@ -157,7 +187,9 @@ export function gauge(run: RunView | null, mode: Mode): GaugeView {
   let target: number | null = null;
   let targetColor: string = C.yellow;
 
-  if (mode === 'red') { target = expected; targetColor = C.red; label = `Output · ${expected} % never reached`; }
+  if (mode === 'red' && writes && Number.isFinite(expected) && run && blockedDetail(run).reason === 'BOUNDARY_EXCEEDED') {
+    target = expected; targetColor = C.red; label = `Output · ${expected} % never reached`;
+  }
   else if (mode === 'replay') { target = expected; targetColor = C.red; }
   else if (mode === 'yellow') { target = expected; label = `Output · target ${expected} %`; }
   else if (mode === 'exec') { target = expected; label = !inBand ? 'Output · outside band' : value === expected ? 'Output · at target' : `Output · target ${expected} %`; }

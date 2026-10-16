@@ -1,0 +1,39 @@
+# Runs on GitHub on every push and PR, and on a laptop with `act` (needs Docker), from the repo root:
+#   act -j api      # back-end tests only
+#   act             # both jobs, same as GitHub
+# No API keys needed: every sponsor adapter falls back to its local stand-in.
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  api:
+    name: API tests (pytest)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scram/api
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - run: pytest -q
+
+  web:
+    name: Web build (tsc + vite)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: scram/web
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
