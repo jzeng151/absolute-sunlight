@@ -61,9 +61,12 @@ def decide(action: dict) -> tuple[str, str, str]:
     return "RED", "NO_AUTHORITY", "NC-06"
 
 
-def typed_action_from_case(case: dict, run_id: str, actor_id: str, confidence: float = 1.0) -> dict:
-    params = case["normalized_parameters"]
-    post = case["expected_postcondition"]
+def typed_action_from_case(case: dict, run_id: str, actor_id: str, confidence: float = 1.0,
+                           current_output: float | None = None) -> dict:
+    params = dict(case["normalized_parameters"])
+    post = dict(case["expected_postcondition"])
+    if case["tool"] == "adjust_output" and current_output is not None:
+        post["output_percent"] = current_output + params["delta_percent"]
     return {
         "run_id": run_id,
         "actor_id": actor_id,
