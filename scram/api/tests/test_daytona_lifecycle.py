@@ -1,0 +1,92 @@
+"""Lifecycle tests use a fake client and make no Daytona requests."""
+import threading
+from types import SimpleNamespace
+from unittest.mock import Mock
+
+import pytest
+from fastapi.testclient import TestClient
+
+from app import config
+from app.adapters.sandbox import DaytonaSandbox, LocalSandbox
+from app.engine import Engine
+
+
+def test_daytona_disables_idle_stop_and_closes_client(monkeypatch):
+    import daytona
+    client = Mock()
+    client.create.return_value = SimpleNamespace(id="test-sandbox", process=Mock())
+    monkeypatch.setattr(daytona, "Daytona", Mock(return_value=client))
+    box = DaytonaSandbox()
+    sandbox = box._box()
+    assert client.create.call_args.args[0].auto_stop_interval == 0
+    box.close()
+    box.close()
+    client.delete.assert_called_once_with(sandbox)
+    client.close.assert_called_once()
+
+
+def test_sdk_without_public_close_releases_transports():
+    box = DaytonaSandbox.__new__(DaytonaSandbox)
+    box._lock = threading.Lock()
+    box._closed = False
+    box._sandbox = None
+    pools = [Mock(), Mock(), Mock()]
+    events = SimpleNamespace(disconnect=Mock())
+    box._client = SimpleNamespace(_api_client=pools[0], _toolbox_api_client=pools[1],
+                                  _http_client=pools[2], _event_dispatcher=events)
+    box.close()
+    for pool in pools:
+        pool.close.assert_called_once()
+    events.disconnect.assert_called_once()
+
+
+def test_health_waits_for_successful_initialization(monkeypatch):
+    entered, release = threading.Event(), threading.Event()
+    class SlowSandbox(LocalSandbox):
+        name = "daytona"
+        def write_state(self, state):
+            entered.set()
+            assert release.wait(2)
+            return super().write_state(state)
+    monkeypatch.setattr("app.engine.make_sandbox", SlowSandbox)
+    e = Engine()
+    try:
+        assert entered.wait(2)
+        assert e.health()["daytona"] == "initializing"
+    finally:
+        release.set()
+    assert e.sandbox_ready.wait(2)
+    assert e.health()["daytona"] == "daytona"
+
+
+def test_shutdown_closes_the_engine(monkeypatch):
+    from app.main import app, engine
+    close = Mock()
+    monkeypatch.setattr(engine, "close", close, raising=False)
+    with TestClient(app):
+        pass
+    close.assert_called_once()
+
+
+def test_failed_initialization_cleans_up_remote_sandbox(monkeypatch):
+    sandbox = Mock(name="daytona")
+    sandbox.write_state.side_effect = RuntimeError("remote init failed")
+    monkeypatch.setattr("app.engine.make_sandbox", lambda: sandbox)
+    e = Engine()
+    assert e.sandbox_ready.wait(2)
+    sandbox.close.assert_called_once()
+    assert e.health()["daytona"] == "local"
+
+
+def test_readiness_timeout_never_touches_sandbox(monkeypatch):
+    monkeypatch.setattr(config, "STEP_SECONDS", 0)
+    e = Engine()
+    assert e.sandbox_ready.wait(2)
+    monkeypatch.setattr(e.sandbox_ready, "wait", lambda timeout: False)
+    read = Mock(side_effect=AssertionError("sandbox is not ready"))
+    monkeypatch.setattr(e.sandbox, "read_state", read)
+    v = e.create_run("C2")
+    e.approve(v["run_id"], "op", v["action"]["action_hash"])
+    from test_safety import settled
+    assert settled(e, v)["machine_state"] == "BLOCKED"
+    read.assert_not_called()

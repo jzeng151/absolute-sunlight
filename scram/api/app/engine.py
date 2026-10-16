@@ -65,6 +65,7 @@ class Engine:
         self.lock = threading.RLock()
         self.transaction_lock = threading.Lock()
         self.writes_locked = False
+        self.closed = False
         self.store = make_store()
         self.store.seed_rules(core.RULEBOOK)
         self.sandbox = make_sandbox()
@@ -91,14 +92,17 @@ class Engine:
             log.exception("sandbox init failed; switching to local sandbox")
             from .adapters.sandbox import LocalSandbox
 
+            self._close_sandbox()
             self.sandbox = LocalSandbox()
             self.sandbox.write_state(self._initial_state())
         finally:
+            if self.closed:
+                self._close_sandbox()
             self.sandbox_ready.set()
 
     def health(self) -> dict[str, Any]:
         return {
-            "daytona": self.sandbox.name,
+            "daytona": self.sandbox.name if self.sandbox_ready.is_set() else "initializing",
             "sandbox_id": self.sandbox.run_id,
             "arize": "on" if trace.enabled else "local only",
             "surrealdb": f"{self.store.kind} ({self.store.url})",
@@ -192,6 +196,8 @@ class Engine:
 
     @synchronized
     def create_run(self, case_id: str) -> dict[str, Any]:
+        if self.closed:
+            raise ForbiddenTransition("engine is shutting down")
         if case_id not in core.CASES:
             raise NotFound(case_id)
         case = core.CASES[case_id]
@@ -339,7 +345,7 @@ class Engine:
         wrote = False
         before: dict[str, Any] = {}
         try:
-            if self.writes_locked:
+            if self.writes_locked or self.closed:
                 raise ForbiddenTransition("writes locked until reset")
             if not self.sandbox_ready.wait(timeout=180):
                 raise TimeoutError("sandbox initialization is still pending")
@@ -450,6 +456,8 @@ class Engine:
 
     def reset(self) -> None:
         with self.transaction_lock, self.lock:
+            if self.closed:
+                raise ForbiddenTransition("engine is shutting down")
             if not self.sandbox_ready.wait(timeout=180):
                 raise ForbiddenTransition("sandbox initialization is still pending")
             self.writes_locked = True
@@ -468,3 +476,20 @@ class Engine:
             self.store.wipe_runs()
             self.output = restored["output_percent"]
             self.writes_locked = False
+
+    def _close_sandbox(self) -> None:
+        close = getattr(self.sandbox, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                log.exception("sandbox cleanup failed")
+
+    def close(self) -> None:
+        with self.lock:
+            self.closed = True
+        # Drain any active transaction before deleting its sandbox. A slow
+        # initializer owns cleanup if it has not finished by this deadline.
+        with self.transaction_lock:
+            if self.sandbox_ready.wait(timeout=180):
+                self._close_sandbox()
