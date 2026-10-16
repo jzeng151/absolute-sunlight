@@ -34,6 +34,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 | **SurrealDB** | Rulebook, runs, approvals, checkpoints, append-only audit. Each run links to its governing rule with a graph edge: `run ->governed_by-> rule`. Try `GET /api/runs/{id}/rules`. | `app/adapters/store.py` | `mem://` runs SurrealDB embedded in-process |
 | **ElevenLabs** | Six control-room voice lines, generated ahead of time so the demo never waits. Run `python -m scripts.make_voice_clips`. | `scripts/make_voice_clips.py` | Text shows, no audio |
 | **Gemini (free)** | Parses the operator's tool, output change, and boundary request. Invalid replies, confidence below 0.8, and failed calls are blocked. Deterministic policy classifies the validated action. | `app/adapters/others.py` | Prepared typed actions only when no model key is configured |
+| **Anchor Browser** | Case C1 is a governed, read-only browser action: SCRAM authorizes it as GREEN under NC-01, then Anchor fetches a public NRC page. The tool and URL are hashed before policy checks. Only HTTPS pages on `www.nrc.gov` are allowed. Fetch failures end BLOCKED with CONTROL_UNAVAILABLE. Nothing is submitted. | `app/adapters/others.py` | Read step runs without a browser |
 
 ## Endpoints
 

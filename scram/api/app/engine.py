@@ -138,7 +138,7 @@ class Engine:
             "surrealdb": f"{self.store.kind} ({self.store.url})",
             "agent_memory": "on" if memory.enabled() else "off",
             "elevenlabs": "key set" if config.ELEVENLABS_API_KEY else "cached clips only",
-            "anchor": "off",
+            "anchor": "on" if config.ANCHOR_API_KEY else "off",
             "model": config.GEMINI_MODEL if config.GEMINI_API_KEY else "prepared actions",
             "fault": self.fault,
         }
@@ -258,6 +258,10 @@ class Engine:
             run["action"] = (core.typed_action_from_reading(reading, run_id, ACTOR, self.verified_output) if using_model
                              else core.typed_action_from_case(case, run_id, ACTOR, current_output=self.verified_output))
             confidence = run["action"]["confidence"]
+            if case_id == "C1" and config.ANCHOR_API_KEY and run["action"]["intent"] == "read":
+                browser_case = {**case, "tool": "anchor.fetch_webpage", "target": config.ANCHOR_READ_URL,
+                                "normalized_parameters": {}, "expected_postcondition": {}}
+                run["action"] = core.typed_action_from_case(browser_case, run_id, ACTOR, confidence)
         except ValueError:
             confidence = 0.0
         model = config.GEMINI_MODEL if using_model else "prepared"
@@ -290,15 +294,24 @@ class Engine:
         if state == "GREEN":
             # Independently observe the read-only branch. Failure to observe is not proof of no mutation.
             read_evidence, read_outcome = {}, "ok"
+            action = run["action"]
+            read = {"source": "skipped"}
             try:
                 if not self.sandbox_ready.wait(timeout=180):
                     raise TimeoutError("sandbox initialization is still pending")
-                read_evidence = {"state_before": self.sandbox.read_state(), "state_after": self.sandbox.read_state()}
+                before_read = self.sandbox.read_state()
+                read = others.anchor_read(action["target"]) if action["tool"] == "anchor.fetch_webpage" else {"source": "skipped"}
+                read_evidence = {"state_before": before_read, "state_after": self.sandbox.read_state()}
+                if read["source"] == "error":
+                    read_outcome = "error"
             except Exception as error:
                 read_evidence, read_outcome = {"error_type": type(error).__name__}, "error"
-            tr.step("read", "TOOL", evidence=read_evidence, outcome=read_outcome, ok=read_outcome == "ok", **{"tool.name": "analyze_history"})
+            tr.step("read", "TOOL", evidence=read_evidence, outcome=read_outcome, ok=read_outcome == "ok", **{"tool.name": action["tool"], "scram.source": read["source"], "scram.url": read.get("url"), "scram.chars": read.get("chars")})
             run["trace_spans"].append(_span("read", read_outcome, "no write" if read_outcome == "ok" else "state observation unavailable"))
-            self._move(run, "COMPLETED")
+            failed = read["source"] == "error"
+            if failed:
+                run["block_reasons"] = ["CONTROL_UNAVAILABLE"]
+            self._move(run, "BLOCKED" if failed else "COMPLETED")
             run["trace_spans"].append(_span("audit", "ok", "recorded"))
             self._finish(run)
             return self.view(run)
