@@ -1,11 +1,11 @@
-"""Run tracing via OpenTelemetry, with OpenInference span kinds.
+"""Arize AX tracing via OpenTelemetry + OpenInference.
 
 One root span per run ("scram.run"), with a child span for every step in the required order:
 normalize → policy → approval → checkpoint → execute → verify → rollback → audit.
 Evaluator results are attached to the root span as `eval.<name>.label` / `.score` attributes,
-so an exporter can show them as columns.
+so they show up as columns in Arize.
 
-No exporter is registered yet, so spans go to OpenTelemetry's no-op tracer; the in-app trace never depends on one.
+Without ARIZE keys the same spans go to a no-op tracer; the in-app trace never depends on Arize.
 """
 from __future__ import annotations
 
@@ -24,8 +24,18 @@ enabled = False
 
 
 def setup() -> None:
-    """No exporter yet: spans stay in-process."""
-    log.info("no trace exporter configured; tracing locally only")
+    global enabled
+    if not (config.ARIZE_SPACE_ID and config.ARIZE_API_KEY):
+        log.info("Arize keys missing; tracing locally only")
+        return
+    try:
+        from arize.otel import register
+
+        register(space_id=config.ARIZE_SPACE_ID, api_key=config.ARIZE_API_KEY, project_name=config.ARIZE_PROJECT, verbose=False)
+        enabled = True
+        log.info("Arize tracing on (project %s)", config.ARIZE_PROJECT)
+    except Exception:  # noqa: BLE001
+        log.exception("Arize register failed; tracing locally only")
 
 
 def _tracer():

@@ -25,6 +25,12 @@ npm run dev
 
 Check what is connected: `curl localhost:8000/api/health`.
 
+## What each sponsor tool does
+
+| Tool | Job in SCRAM | Where | Without a key |
+|---|---|---|---|
+| **Arize AX** | One trace per run: normalize → policy → approval → checkpoint → execute → verify → rollback → audit. The four evaluator results are attached to the root span as `eval.*` attributes. | `app/adapters/trace.py` | No-op tracer; in-app trace still shows |
+
 ## Endpoints
 
 | Method | Path | Does |
