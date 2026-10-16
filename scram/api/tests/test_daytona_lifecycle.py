@@ -68,6 +68,16 @@ def test_shutdown_closes_the_engine(monkeypatch):
     close.assert_called_once()
 
 
+def test_repeated_lifespans_create_a_working_engine(monkeypatch):
+    import app.main as main
+    monkeypatch.setattr(main, "engine", Engine())
+    for _ in range(2):
+        with TestClient(main.app) as client:
+            response = client.post("/api/runs", json={"case_id": "C1"})
+            assert response.status_code == 200
+            assert response.json()["machine_state"] == "COMPLETED"
+
+
 def test_failed_initialization_cleans_up_remote_sandbox(monkeypatch):
     sandbox = Mock(name="daytona")
     sandbox.write_state.side_effect = RuntimeError("remote init failed")

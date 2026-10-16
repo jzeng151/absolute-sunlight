@@ -19,6 +19,9 @@ engine = Engine()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global engine
+    if engine.closed:
+        engine = Engine()
     try:
         yield
     finally:
