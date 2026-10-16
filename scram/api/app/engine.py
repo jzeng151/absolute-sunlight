@@ -16,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from . import config, core
-from .adapters import others, trace
+from .adapters import memory, others, trace
 from .adapters.sandbox import make_sandbox
 from .adapters.store import make_store
 
@@ -89,6 +89,7 @@ class Engine:
             "sandbox_id": self.sandbox.run_id,
             "arize": "on" if trace.enabled else "local only",
             "surrealdb": f"{self.store.kind} ({self.store.url})",
+            "agent_memory": "on" if memory.enabled() else "off",
             "elevenlabs": "key set" if config.ELEVENLABS_API_KEY else "cached clips only",
             "anchor": "off",
             "model": config.GEMINI_MODEL if config.GEMINI_API_KEY else "prepared actions",
@@ -134,6 +135,7 @@ class Engine:
         run["evaluators"] = self._evaluate(run)
         tr = self.traces.get(run["run_id"])
         self.store.audit(run["run_id"], run["machine_state"], {"block_reasons": run["block_reasons"]})
+        memory.record_run(run)
         if tr:
             tr.step("audit", "CHAIN", recorded=True)
             tr.evals(run["evaluators"])
@@ -395,3 +397,4 @@ class Engine:
             self.store.wipe_runs()
             self.sandbox_ready.wait(timeout=180)
             self.output = self.sandbox.write_state(self._initial_state())["output_percent"]
+            memory.record_reset(self.output)
