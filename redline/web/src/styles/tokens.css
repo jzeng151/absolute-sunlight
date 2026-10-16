@@ -1,0 +1,51 @@
+/* Visual tokens — "The Five Rings". REDLINE Build Spec, section 8.
+   Light: sumi ink on washi. Dark: ink-wash night, paper turned to slate.
+   One vermilion for danger and the call; indigo for caution and the baseline. */
+
+:root {
+  color-scheme: light;
+  --rl-ground:       #f1ebdf;
+  --rl-paper:        #f7f3ea;
+  --rl-line:         #cfc5b3;
+  --rl-ink:          #1b1916;
+  --rl-ink-muted:    #5e574d;
+  --rl-vermilion:    #b8321f;
+  --rl-indigo:       #2c4a6b;
+  --rl-on-vermilion: #f7f3ea;
+  --rl-on-ink:       #f1ebdf;
+  --rl-wash:         rgba(27, 25, 22, 0.05);
+
+  --rl-font-display: "Shippori Mincho", "Hiragino Mincho ProN", serif;
+  --rl-font-body:    "Zen Kaku Gothic New", "Hiragino Sans", sans-serif;
+  --rl-font-mono:    "DM Mono", ui-monospace, monospace;
+
+  --rl-size-kanji:   46px;
+  --rl-size-state:   44px;
+  --rl-size-call:    36px;
+  --rl-size-title:   30px;
+  --rl-size-option:  26px;
+  --rl-size-value:   24px;
+  --rl-size-body:    15px;
+  --rl-size-eyebrow: 12px;
+
+  --rl-pad-zone:     26px 36px;
+  --rl-gap-section:  24px;
+  --rl-radius:       0;
+  --rl-target:       44px;
+  --rl-enso-size:    330px;
+  --rl-enso-draw:    900ms;
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --rl-ground:       #141311;
+  --rl-paper:        #1d1b18;
+  --rl-line:         #3a3630;
+  --rl-ink:          #ece6da;
+  --rl-ink-muted:    #a49c8e;
+  --rl-vermilion:    #e5604a;
+  --rl-indigo:       #86a6cc;
+  --rl-on-vermilion: #141311;
+  --rl-on-ink:       #141311;
+  --rl-wash:         rgba(236, 230, 218, 0.04);
+}

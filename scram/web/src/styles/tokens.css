@@ -1,0 +1,64 @@
+/* Visual tokens — "The Codex". SCRAM Build Spec, section 8.
+   Two folios: iron-gall ink at night (dark) and red chalk on parchment (light).
+   Red chalk (sanguine) is Leonardo's drawing medium; it carries every construction line in both themes. */
+
+:root {
+  color-scheme: dark;
+  /* ground and ink — iron-gall night */
+  --scram-ground:      #15120e;
+  --scram-panel:       #1c1813;
+  --scram-line:        #3d342a;
+  --scram-band:        #2a3a30;
+  --scram-ink:         #ece0c8;
+  --scram-ink-muted:   #a8977a;
+  --scram-chalk:       #c65a3e;   /* sanguine: drawings, flourishes, mirror note */
+
+  /* state */
+  --scram-green:       #7fb59a;   /* verdigris */
+  --scram-yellow:      #d9a94e;   /* ochre */
+  --scram-red:         #e0674a;   /* red chalk, at full strength */
+  --scram-on-yellow:   #15120e;
+  --scram-on-ink:      #15120e;
+
+  /* type */
+  --scram-font-display: "Engraver's Gothic", "Cormorant Garamond", Garamond, serif;
+  --scram-font-label:   "IBM Plex Sans Condensed", "Arial Narrow", sans-serif;
+  --scram-font-mono:    "IBM Plex Mono", ui-monospace, monospace;
+
+  --scram-size-state:   76px;
+  --scram-size-value:   64px;
+  --scram-size-title:   34px;
+  --scram-size-quote:   24px;
+  --scram-size-rule:    20px;
+  --scram-size-body:    15px;
+  --scram-size-mono:    14px;
+  --scram-size-eyebrow: 12px;
+
+  /* space and shape */
+  --scram-pad-zone:     24px 32px;
+  --scram-gap-section:  22px;
+  --scram-radius:       0;
+  --scram-hairline:     1px;
+  --scram-target:       44px;
+  --scram-fade:         200ms;
+  --scram-draw:         900ms;
+  --scram-chalk-opacity: 0.5;
+}
+
+/* Red chalk on parchment */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --scram-ground:      #efe5d0;
+  --scram-panel:       #f7f0e0;
+  --scram-line:        #cdb795;
+  --scram-band:        #cfe0cf;
+  --scram-ink:         #2a1d14;
+  --scram-ink-muted:   #6b5640;
+  --scram-chalk:       #a9452c;
+  --scram-green:       #2f6b50;
+  --scram-yellow:      #8a5a10;
+  --scram-red:         #a83a22;
+  --scram-on-yellow:   #f7f0e0;
+  --scram-on-ink:      #efe5d0;
+  --scram-chalk-opacity: 0.62;
+}
