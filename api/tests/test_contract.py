@@ -1,4 +1,4 @@
-"""The API returns exactly what scram/web/src/types.ts declares, in every state the demo reaches.
+"""The API returns exactly what web/src/types.ts declares, in every state the demo reaches.
 
 If the back end adds, drops or renames a field, or emits a state or reason code the front end
 doesn't know, this fails before the screen does.

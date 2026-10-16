@@ -10,7 +10,7 @@ from app.adapters.sandbox import DaytonaSandbox
 
 def run_smoke() -> dict:
     if not config.DAYTONA_API_KEY:
-        raise RuntimeError("Set DAYTONA_API_KEY in scram/api/.env before running this check")
+        raise RuntimeError("Set DAYTONA_API_KEY in api/.env before running this check")
     box = DaytonaSandbox()
     initial = {"target": core.REACTOR["target"], "output_percent": 72}
     try:
@@ -45,7 +45,7 @@ def run_smoke() -> dict:
 
 def main() -> int:
     if not config.DAYTONA_API_KEY:
-        print("Set DAYTONA_API_KEY in scram/api/.env before running this check", file=sys.stderr)
+        print("Set DAYTONA_API_KEY in api/.env before running this check", file=sys.stderr)
         return 1
     try:
         print(json.dumps(run_smoke(), indent=2))

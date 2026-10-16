@@ -1,4 +1,4 @@
-"""Settings, read once from the environment (scram/api/.env).
+"""Settings, read once from the environment (api/.env).
 
 Every sponsor integration is optional at runtime: when its key is missing, its adapter
 falls back to a local implementation with the same interface, and /api/health says so.
