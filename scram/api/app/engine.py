@@ -91,7 +91,7 @@ class Engine:
             "surrealdb": f"{self.store.kind} ({self.store.url})",
             "agent_memory": "on" if memory.enabled() else "off",
             "elevenlabs": "key set" if config.ELEVENLABS_API_KEY else "cached clips only",
-            "anchor": "off",
+            "anchor": "on" if config.ANCHOR_API_KEY else "off",
             "model": config.GEMINI_MODEL if config.GEMINI_API_KEY else "prepared actions",
             "fault": self.fault,
         }
@@ -195,8 +195,9 @@ class Engine:
         run["trace_spans"].append(_span(f"policy · {state}", "error" if state == "RED" else "ok"))
 
         if state == "GREEN":
-            tr.step("read", "TOOL", **{"tool.name": "analyze_history"})
-            run["trace_spans"].append(_span("read", "ok", "no write"))
+            read = others.anchor_read() if case_id == "C1" else {"source": "skipped"}
+            tr.step("read", "TOOL", **{"tool.name": "anchor.fetch_webpage" if read["source"] == "anchor" else "analyze_history", "scram.url": read.get("url"), "scram.chars": read.get("chars")})
+            run["trace_spans"].append(_span("read", "ok", "Anchor · no write" if read["source"] == "anchor" else "no write"))
             self._move(run, "COMPLETED")
             run["trace_spans"].append(_span("audit", "ok", "recorded"))
             self._finish(run)

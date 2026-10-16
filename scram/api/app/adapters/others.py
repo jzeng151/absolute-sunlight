@@ -1,4 +1,4 @@
-"""Model parser (Gemini) and voice lines (ElevenLabs)."""
+"""Model parser (Gemini), governed browser read (Anchor Browser) and voice lines (ElevenLabs)."""
 from __future__ import annotations
 
 import json
@@ -39,6 +39,29 @@ def parse_with_model(text: str) -> dict[str, Any] | None:
     except Exception:  # noqa: BLE001
         log.exception("Gemini parse failed; using the prepared typed action")
         return None
+
+
+# ---------- Anchor Browser: the GREEN read-only action ----------
+
+
+def anchor_read(url: str | None = None) -> dict[str, Any]:
+    """Fetch a public page through Anchor Browser, read-only. Policy allows this under NC-01.
+
+    Returns {"source": "anchor"|"skipped", "url", "chars", "excerpt"}.
+    """
+    url = url or config.ANCHOR_READ_URL
+    if not config.ANCHOR_API_KEY:
+        return {"source": "skipped", "url": url, "chars": 0, "excerpt": ""}
+    try:
+        from anchorbrowser import Anchorbrowser
+
+        client = Anchorbrowser(api_key=config.ANCHOR_API_KEY)
+        text = client.tools.fetch_webpage(url=url, timeout=40)
+        text = text if isinstance(text, str) else str(text)
+        return {"source": "anchor", "url": url, "chars": len(text), "excerpt": " ".join(text.split())[:240]}
+    except Exception:  # noqa: BLE001
+        log.exception("Anchor fetch failed")
+        return {"source": "error", "url": url, "chars": 0, "excerpt": ""}
 
 
 # ---------- ElevenLabs: control-room voice lines ----------

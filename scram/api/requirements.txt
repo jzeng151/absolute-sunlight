@@ -8,4 +8,5 @@ arize-otel>=0.14
 opentelemetry-sdk>=1.40
 surrealdb>=2.0
 elevenlabs>=2.0
+anchorbrowser>=1.0
 pytest>=8

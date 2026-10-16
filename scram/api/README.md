@@ -33,6 +33,7 @@ Check what is connected: `curl localhost:8000/api/health`.
 | **Arize AX** | One trace per run: normalize → policy → approval → checkpoint → execute → verify → rollback → audit. The four evaluator results are attached to the root span as `eval.*` attributes. | `app/adapters/trace.py` | No-op tracer; in-app trace still shows |
 | **SurrealDB** | Rulebook, runs, approvals, checkpoints, append-only audit. Each run links to its governing rule with a graph edge: `run ->governed_by-> rule`. Try `GET /api/runs/{id}/rules`. | `app/adapters/store.py` | `mem://` runs SurrealDB embedded in-process |
 | **ElevenLabs** | Six control-room voice lines, generated ahead of time so the demo never waits. Run `python -m scripts.make_voice_clips`. | `scripts/make_voice_clips.py` | Text shows, no audio |
+| **Anchor Browser** | Case C1 is a governed, read-only browser action: SCRAM authorizes it as GREEN under NC-01, then Anchor fetches a public NRC page. Nothing is submitted. | `app/adapters/others.py` | Read step runs without a browser |
 | **Gemini (free)** | Reads the operator's words and reports a confidence. Below 0.8 the request is blocked. It never sets GREEN / YELLOW / RED. | `app/adapters/others.py` | Prepared typed actions |
 
 ## Endpoints
