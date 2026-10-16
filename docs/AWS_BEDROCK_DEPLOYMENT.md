@@ -39,6 +39,19 @@ AWS_REGION=us-west-2 python scripts/bedrock_smoke.py --output /tmp/bedrock-resul
 
 To verify a deployed disposable demo, use `--base-url https://YOUR_DISTRIBUTION.cloudfront.net`. The smoke script resets demo state and changes its fault switch. It performs five real parser calls and validates execution outcomes.
 
+## Event deployment
+
+The event app is deployed at <https://ddo4ckt1km4e6.cloudfront.net> in `us-west-2`, using CloudFormation stack `scram-event-demo-console` and CloudFront distribution `E3M42ZUC9XTQ80`. The stack reached `CREATE_COMPLETE` on October 16, 2026. ECS has one running task, and the HTTPS health endpoint reports `sandbox_ready=true`, `model_provider=bedrock` and `us.amazon.nova-lite-v1:0`.
+
+All five scenarios in the table above also passed through the deployed HTTPS API. The live browser UI pauses for exact-action approval, then displays SAFE STATE RESTORED after the injected fault, with output 72 → 92 → 72 and matching rollback checksums. The frontend, health endpoint and cached audio assets return HTTP 200.
+
+The endpoint permits the presenter's current public IPv4 address. If it returns `Access denied` after a network change, update only the stack's `AllowedViewerIp` parameter to the new address. Public egress changed once during this deployment, so recheck it before presenting. This restriction does not make the URL available to judges on other networks.
+
+The initial attempt, `scram-event-demo`, rolled back because the cloud IDE role lacked `ecs:CreateCluster`. The successful stack uses the participant console role. The images are pinned by digest:
+
+- API: `sha256:1b6adab65a4d44b14a38caf4ca03488cf07a8e9aaf8bdbd0c76e8b4dc5755051`
+- Web: `sha256:ce9b200b9145697b70e69b00b51cac136fa13d5bfa8b87603b89f36076770153`
+
 ## Container and infrastructure configuration
 
 `api/Dockerfile` includes the shared fixtures, runs as a nonroot user and starts one Uvicorn worker. `web/Dockerfile` builds the live frontend and serves it from nonroot nginx. Both run in one Fargate task, with nginx proxying `/api/` to the API over localhost. The browser uses one HTTPS origin.
@@ -54,7 +67,7 @@ There is one replica because active runs and approvals live in the API process. 
 1. Build both images from the repository root on an ARM64 machine, tagged `scram-api:bedrock` and `scram-web:bedrock`.
 2. Run `deploy/publish_images.py --account-id EVENT_ACCOUNT_ID --tag UNIQUE_RELEASE_TAG`. It creates private ECR repositories if missing, pushes both images and records immutable digest URIs. Its temporary Docker login is removed after the push.
 3. Run `deploy/prepare_deployment.py` with the event account ID, presenter IPv4 address, VPC, two public subnets in distinct AZs and the regional CloudFront prefix-list ID. It validates the template and creates a change set without executing it. The origin header is randomly generated and omitted from output.
-4. Review and execute the prepared change set with CloudFormation. This creates IAM roles and network access for the demo.
+4. Review and execute the prepared change set with CloudFormation. This creates IAM roles and network access for the demo. The event cloud IDE role can invoke Bedrock and publish ECR images but cannot create an ECS cluster. Use the participant console role for stack creation. Upload `deploy/cloudformation.yaml` in the console and supply the same reviewed parameters; leave the optional CloudFormation service role unset so it uses the participant credentials.
 5. Wait for the stack and ECS service to stabilize. Inspect `/api/health` for `model_provider=bedrock`, `sandbox_ready=true` and the expected model. Run the five-scenario smoke against the HTTPS URL from the allowed network.
 6. After the event, remove the demo stack and its ECR images/repositories when no longer needed. The workshop account itself expires at the event's scheduled end.
 
