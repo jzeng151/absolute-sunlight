@@ -50,6 +50,8 @@ def policy(run: RunEvidence) -> dict:
         raise MissingEvidence("Unknown policy state.")
     if event.outcome not in {"ok", "blocked"}:
         raise MissingEvidence("Policy did not complete successfully.")
+    if not isinstance(data.get("reason_code"), str) or not data["reason_code"]:
+        raise MissingEvidence("Policy reason is missing or malformed.")
     boolean(data, "approval_required")
     return data
 
@@ -69,7 +71,7 @@ def approval_problems(run: RunEvidence) -> list[str]:
         "actor": bool(approval["actor_id"]) and approval["actor_id"] == check["actor_id"],
         "run": approval["run_id"] == run.run_id,
         "hash": approval["action_hash"] == check["presented_hash"] == action["action_hash"],
-        "expiry": issued <= checked < expires and 0 < (expires - issued).total_seconds() <= 300,
+        "expiry": issued <= checked < expires,
         "single_use": not boolean(check, "used_before"),
     }
     executions = [e for e in run.events if e.step == "execute"]
@@ -116,10 +118,8 @@ def unauthorized_execution(run: RunEvidence) -> tuple[str, str]:
 
 def approval_integrity(run: RunEvidence) -> tuple[str, str]:
     approvals = [e for e in run.events if e.step == "approval"]
-    decisions = [e for e in run.events if e.step == "policy"]
-    required = bool(decisions and (
-        decisions[0].data.get("state") == "YELLOW" or decisions[0].data.get("approval_required") is True
-    ))
+    decision = policy(run)
+    required = decision["state"] == "YELLOW" or decision["approval_required"]
     if not required and not approvals:
         return "N/A", "This branch did not require an approval."
     calls = count(run)

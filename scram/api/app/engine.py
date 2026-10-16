@@ -177,7 +177,7 @@ class Engine:
             except Exception as error:
                 read_evidence, read_outcome = {"error_type": type(error).__name__}, "error"
             tr.step("read", "TOOL", evidence=read_evidence, outcome=read_outcome, ok=read_outcome == "ok", **{"tool.name": "analyze_history"})
-            run["trace_spans"].append(_span("read", "ok", "no write"))
+            run["trace_spans"].append(_span("read", read_outcome, "no write" if read_outcome == "ok" else "state observation unavailable"))
             self._move(run, "COMPLETED")
             run["trace_spans"].append(_span("audit", "ok", "recorded"))
             self._finish(run)
@@ -241,7 +241,7 @@ class Engine:
             raise ForbiddenTransition("run is not awaiting approval")
         tr = self.traces[run_id]
         expected = run["action"]["action_hash"]
-        expired = _now() > datetime.fromisoformat(run["approval_expires_at"])
+        expired = _now() >= datetime.fromisoformat(run["approval_expires_at"])
         if presented_hash != expected or expired:
             reason = "APPROVAL_EXPIRED" if expired else "HASH_MISMATCH"
             self._move(run, "BLOCKED")
@@ -259,8 +259,7 @@ class Engine:
 
         run["_approval_used_before"] = bool(run["approval"] and run["approval"]["used"])
         run["approval"] = {"approval_id": f"apv_{run_id[-4:]}", "actor_id": actor_id, "action_hash": expected,
-                           "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": True, "decision": "approve"}
-        self.used_approval_hashes.add(expected)
+                           "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": False, "decision": "approve"}
         self.store.save_approval(run["approval"])
         tr.step("approval", "GUARDRAIL", evidence={**run["approval"], "run_id": run_id}, **{"scram.approver": actor_id, "scram.action_hash": expected})
         run["trace_spans"][-1] = _span("approval", "ok", expected)
@@ -272,6 +271,14 @@ class Engine:
 
     def get(self, run_id: str) -> dict[str, Any]:
         return self.view(self._get(run_id))
+
+    def get_evidence(self, run_id: str) -> dict[str, Any]:
+        with self.lock:
+            self._get(run_id)
+            tr = self.traces.get(run_id)
+            if tr is None:
+                raise NotFound(run_id)
+            return tr.snapshot()
 
     # ---------- execution (background) ----------
 
@@ -300,16 +307,28 @@ class Engine:
             self._set_span(run, "checkpoint", "ok", cp["checkpoint_id"])
             self._pace(t)
 
-            # Re-check the approval hash immediately before changing state.
+            # Check the actual approval window after checkpointing, before dispatch.
+            checked_at = _now()
             hash_matches = run["approval"]["action_hash"] == run["action"]["action_hash"]
-            tr.step("approval.check", "GUARDRAIL", ok=hash_matches, outcome="ok" if hash_matches else "blocked", evidence={
+            expired = checked_at >= datetime.fromisoformat(run["approval"]["expires_at"])
+            reasons = (["HASH_MISMATCH"] if not hash_matches else []) + (["APPROVAL_EXPIRED"] if expired else [])
+            valid = not reasons
+            if valid:
+                run["approval"]["used"] = True
+                self.store.save_approval(run["approval"])
+                self.used_approval_hashes.add(run["approval"]["action_hash"])
+            tr.step("approval.check", "GUARDRAIL", ok=valid, outcome="ok" if valid else "blocked", evidence={
                 "approval_id": run["approval"]["approval_id"], "actor_id": run["approval"]["actor_id"],
-                "presented_hash": run["action"]["action_hash"], "checked_at": _now().isoformat(),
+                "presented_hash": run["action"]["action_hash"], "checked_at": checked_at.isoformat(),
                 "used_before": run["_approval_used_before"], "consumed": run["approval"]["used"],
-                "valid": hash_matches, "reason_codes": [] if hash_matches else ["HASH_MISMATCH"],
+                "valid": valid, "reason_codes": reasons,
             })
-            if not hash_matches:
-                raise ForbiddenTransition("approval hash changed before execution")
+            if not valid:
+                run["block_reasons"] = reasons
+                self._set_span(run, "approval", "error", ", ".join(reasons))
+                self._set_span(run, "execute", "skipped", "invalid approval")
+                self._set_span(run, "verify", "skipped", "no execution")
+                raise ForbiddenTransition("approval invalid before execution")
             self._move(run, "EXECUTING")
             self._set_span(run, "execute", "running")
             t = time.time()
@@ -349,7 +368,7 @@ class Engine:
                 self._rollback(run, before)
             else:
                 run["machine_state"] = "BLOCKED"
-                run["block_reasons"] = ["CONTROL_UNAVAILABLE"]
+                run["block_reasons"] = run["block_reasons"] or ["CONTROL_UNAVAILABLE"]
                 run["voice_line"] = None
                 self._set_span(run, "audit", "ok", f"blocked: {type(e).__name__}")
                 self._finish(run)

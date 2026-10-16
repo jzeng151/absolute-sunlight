@@ -83,6 +83,8 @@ request deadline, so a stalled request can occupy the daemon worker until it ret
 the queue remains bounded and control execution continues. Shutdown can lose pending uploads.
 
 See [the evidence contract](../../docs/SCRAM_ARIZE_EVENT_CONTRACT.md) for backend hooks.
-Evaluators observe existing control behavior. They do not fix the core's execution, reset,
-or write-lock enforcement. For example, an executor timeout after a write now produces
+Evaluators observe existing control behavior. This integration also rejects approval expiry
+at the execution boundary, after checkpointing; an approval is consumed only when that
+check succeeds. It does not fix the core's uncertain-write recovery, reset coordination,
+or write-lock enforcement. An executor timeout after a write therefore produces
 missing-recovery evidence rather than four passing evaluations.

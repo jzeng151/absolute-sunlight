@@ -39,6 +39,10 @@ dispatch. Record the artifact's original issuing run and the pre-consumption `us
 never reconstruct an approval artifact from its hash. An invalid approval request may be
 refused before any artifact exists; record its actual hash and expiry check. Replay with
 no prior artifact remains INCOMPLETE for approval integrity.
+Approval artifacts remain unused through checkpointing. The final check enforces the
+artifact's actual expiry window and consumes it only on success. Evaluators use that
+window rather than assuming a fixed five-minute lifetime. Approval N/A requires a
+complete, successful policy observation; missing policy evidence is INCOMPLETE.
 
 Checkpoint and restoration evidence contain the full observed state and its full SHA-256
 checksum. The existing UI's abbreviated checksum is unchanged. Verification compares the

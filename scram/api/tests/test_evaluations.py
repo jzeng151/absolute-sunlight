@@ -1,7 +1,7 @@
 """Regression tests over evidence from the real Engine, including dishonest outcomes."""
 from copy import deepcopy
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from time import monotonic, sleep
 
 import pytest
@@ -199,3 +199,69 @@ def test_real_rollback_failure_is_a_failed_evaluation(engine, monkeypatch):
     v = approve(engine, engine.create_run("C2"))
     assert v["machine_state"] == "LOCKED"
     assert labels(engine.traces[v["run_id"]].evidence)["Rollback verification"] == "FAIL"
+
+
+def test_configured_long_approval_lifetime_is_not_a_false_failure(engine, monkeypatch):
+    monkeypatch.setattr(config, "APPROVAL_TTL_SECONDS", 600)
+    v = approve(engine, engine.create_run("C2"))
+    observed = engine.traces[v["run_id"]].evidence
+    approval = data(observed, "approval")
+    assert (timestamp(approval["expires_at"]) - timestamp(approval["issued_at"])).total_seconds() > 300
+    assert set(labels(observed).values()) == {"PASS"}
+
+
+@pytest.mark.parametrize("failure_at", [1, 2])
+def test_failed_read_observation_is_visible_in_run_view(engine, monkeypatch, failure_at):
+    original = engine.sandbox.read_state
+    calls = 0
+    def read():
+        nonlocal calls
+        calls += 1
+        if calls == failure_at:
+            raise OSError("state unavailable")
+        return original()
+    monkeypatch.setattr(engine.sandbox, "read_state", read)
+    v = engine.create_run("C1")
+    display = next(s for s in v["trace_spans"] if s["name"] == "read")
+    observed = engine.traces[v["run_id"]].evidence
+    assert display["status"] == "error" and display["detail"] != "no write"
+    assert next(e for e in observed.events if e.step == "read").outcome == "error"
+    assert labels(observed)["Trajectory order"] == "INCOMPLETE"
+
+
+def test_approval_expiring_during_checkpoint_never_reaches_executor(engine, monkeypatch):
+    v = engine.create_run("C2")
+    expires = datetime.now(timezone.utc) + timedelta(seconds=0.2)
+    engine.runs[v["run_id"]]["approval_expires_at"] = expires.isoformat()
+    def wait_for_expiry(_):
+        sleep(max(0, (expires - datetime.now(timezone.utc)).total_seconds()) + 0.01)
+    monkeypatch.setattr(engine, "_pace", wait_for_expiry)
+    result = approve(engine, v)
+    observed = engine.traces[v["run_id"]].evidence
+    check = data(observed, "approval.check")
+    assert result["machine_state"] == "BLOCKED"
+    assert result["block_reasons"] == ["APPROVAL_EXPIRED"]
+    assert result["execution"] is None and observed.executor_call_count == 0
+    assert engine.sandbox.read_state()["output_percent"] == 72
+    assert check["valid"] is False and check["consumed"] is False
+    assert check["reason_codes"] == ["APPROVAL_EXPIRED"]
+    assert timestamp(check["checked_at"]) >= expires
+    assert labels(observed)["Approval integrity"] == "PASS"
+
+
+@pytest.mark.parametrize("mutation", ["missing", "duplicate", "state", "required", "reason", "error"])
+def test_approval_inapplicability_requires_valid_policy_evidence(suite, mutation):
+    run = suite["C1"]
+    if mutation == "missing":
+        remove(run, "policy")
+    elif mutation == "duplicate":
+        run.events.append(next(e for e in run.events if e.step == "policy"))
+    elif mutation == "state":
+        data(run, "policy")["state"] = "UNKNOWN"
+    elif mutation == "required":
+        data(run, "policy")["approval_required"] = "false"
+    elif mutation == "reason":
+        del data(run, "policy")["reason_code"]
+    else:
+        run.events = [replace(e, outcome="error") if e.step == "policy" else e for e in run.events]
+    assert labels(run)["Approval integrity"] == "INCOMPLETE"

@@ -5,8 +5,10 @@ doesn't know, this fails before the screen does.
 """
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -157,3 +159,33 @@ def test_evidence_endpoint_matches_run_and_survives_local_mode():
     assert result["evidence"]["terminal_state"] == "BLOCKED"
     assert [event["step"] for event in result["evidence"]["events"]] == [
         "normalize", "rule.retrieve", "policy", "audit"]
+
+
+def test_evidence_snapshot_is_atomic_with_reset(monkeypatch):
+    v = create("C3")
+    found, release, resetting, reset_done = Event(), Event(), Event(), Event()
+    original = engine._get
+    def pause_after_lookup(run_id):
+        run = original(run_id)
+        found.set()
+        assert release.wait(3)
+        return run
+    def reset_concurrently():
+        resetting.set()
+        engine.reset()
+        reset_done.set()
+    monkeypatch.setattr(engine, "_get", pause_after_lookup)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        snapshot = pool.submit(client.get, f"/api/runs/{v['run_id']}/evidence")
+        assert found.wait(3)
+        reset = pool.submit(reset_concurrently)
+        try:
+            assert resetting.wait(3)
+            assert not reset_done.wait(0.05), "Reset cleared the run during its evidence lookup"
+        finally:
+            release.set()
+        response = snapshot.result(timeout=3)
+        reset.result(timeout=3)
+    assert response.status_code == 200
+    assert response.json()["evidence"]["run_id"] == v["run_id"]
+    assert client.get(f"/api/runs/{v['run_id']}/evidence").status_code == 404

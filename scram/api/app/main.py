@@ -84,8 +84,7 @@ def run_rules(run_id: str):
 
 @app.get("/api/runs/{run_id}/evidence")
 def run_evidence(run_id: str):
-    _guard(engine.get, run_id)
-    return engine.traces[run_id].snapshot()
+    return _guard(engine.get_evidence, run_id)
 
 
 @app.post("/api/fault", status_code=204)
