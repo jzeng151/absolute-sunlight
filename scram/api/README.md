@@ -83,13 +83,18 @@ initialization before closing pending traces. A blocked control adapter can exte
 It then waits up to two seconds for the upload queue. The pinned SDK does not expose a Flight
 request deadline, so a stalled request can occupy the daemon worker until it returns;
 the queue remains bounded and control execution continues. Shutdown can lose pending uploads.
+In `arize==8.59.1`, `update_evaluations(timeout=...)` forwards the deadline only to HTTP.
+The Flight path ignores it and converts its protobuf response to a dictionary, despite
+the method's return annotation. Tests exercise the actual SDK wrapper with a fake Flight
+transport. See the [SDK implementation](https://arize-client-python.readthedocs.io/en/latest/_modules/arize/spans/client.html#SpansClient.update_evaluations).
 
 See [the evidence contract](../../docs/SCRAM_ARIZE_EVENT_CONTRACT.md) for backend hooks.
 Evaluators observe existing control behavior. This integration also rejects approval expiry
 at the execution boundary, after checkpointing, storage, and trace preparation; an approval
 is consumed only when that check succeeds. Approval evidence is exported after dispatch
 so slow telemetry cannot consume the approval window. Evaluators check rejection reasons
-and correlate the retrieved rule IDs and policy version with the decision. GREEN reads
+and compare the observed policy with `core.decide` for the normalized action, as well as
+correlating the retrieved rule IDs and policy version with the decision. GREEN reads
 wait for sandbox readiness. This integration does not fix the core's uncertain-write recovery, reset coordination,
 or write-lock enforcement. An executor timeout after a write therefore produces
 missing-recovery evidence rather than four passing evaluations.

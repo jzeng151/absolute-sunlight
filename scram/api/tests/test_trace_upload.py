@@ -151,6 +151,52 @@ def test_native_upload_retries_unmatched_root_without_false_success(otel, eventu
         uploader.close()
 
 
+@pytest.mark.parametrize("eventual_match", [False, True])
+def test_real_sdk_flight_response_and_timeout_contract(otel, monkeypatch, eventual_match):
+    import pandas as pd
+    from arize import ArizeClient
+    from arize._generated.protocol.flight.flight_pb2 import WriteSpanEvaluationResponse
+    import arize.spans.client as sdk
+
+    requests, constructors = [], []
+    class FlightTransport:
+        def __init__(self, **kwargs):
+            constructors.append(kwargs)
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            pass
+        def log_arrow_table(self, **kwargs):
+            requests.append(kwargs)
+            if eventual_match and len(requests) == 2:
+                return WriteSpanEvaluationResponse(records_updated=1)
+            return WriteSpanEvaluationResponse(unmatched_ids=["0000000000000001"])
+    monkeypatch.setattr(sdk, "ArizeFlightClient", FlightTransport)
+    # Exercise SDK validation, Arrow conversion, and protobuf-to-dict conversion.
+    # Only the network transport is replaced.
+    api_client = ArizeClient(api_key="test-key")
+    uploader = EvaluationUploader(otel[0], api_client, space_id="space", project_name="scram")
+    uploader.stopping.wait = lambda delay: False
+    try:
+        uploader.submit("0000000000000001", [
+            {"name": "Approval integrity", "label": "PASS", "score": 1.0, "explanation": "Valid approval"},
+        ])
+        assert uploader.flush(3)
+        assert uploader.status("0000000000000001") == ("evaluations_submitted" if eventual_match else "error:LookupError")
+        assert len(requests) == (2 if eventual_match else 5)
+    finally:
+        uploader.close()
+    response = api_client.spans.update_evaluations(
+        space_id="space", project_name="scram", timeout=0.01,
+        dataframe=pd.DataFrame([{"context.span_id": "0000000000000001", "eval.test.label": "PASS"}]),
+    )
+    assert isinstance(response, dict)  # Runtime contract differs from the return annotation.
+    # The pinned SDK silently discards timeout on Flight. Passing it cannot bound
+    # this transport; keep the documented limitation until the SDK supports it.
+    assert "timeout" not in requests[-1]
+    assert set(constructors[-1]) == {"sdk_config"}
+
+
 def test_span_export_error_does_not_block_rollback(engine, otel, monkeypatch):
     class BrokenTracer:
         def start_span(self, name, **kwargs):

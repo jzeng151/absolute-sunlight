@@ -57,6 +57,10 @@ class EvaluationUploader:
                     if delay and self.stopping.wait(delay):
                         raise RuntimeError("Uploader closed before span became available")
                     self.statuses[span_id] = "uploading"
+                    # arize==8.59.1 only forwards timeout to HTTP, not this Flight
+                    # path. Its response annotation says protobuf, but the public
+                    # method returns _message_to_dict(response). SDK contract tests
+                    # exercise the real wrapper so neither detail is guessed.
                     response = self.client.spans.update_evaluations(
                         space_id=self.space_id, project_name=self.project_name,
                         dataframe=pd.DataFrame([row]),

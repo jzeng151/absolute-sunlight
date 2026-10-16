@@ -52,8 +52,11 @@ lifetime. Reason codes must match the observed hash, expiry, and reuse failures;
 checks have no rejection reasons. Approval N/A requires a complete, successful policy
 observation; missing policy evidence is INCOMPLETE.
 
-The retrieved rule IDs and policy version must match the decision's authority. Missing
-authority is INCOMPLETE; conflicting authority is FAIL. Wait for sandbox initialization
+The retrieved rule IDs and policy version must match the decision's authority. Evaluators
+also recompute `core.decide` for the normalized action and compare its state, reason, rule,
+approval requirement, and current policy version. Two matching but incorrect authority
+events cannot waive approval. Missing authority is INCOMPLETE; conflicting authority is
+FAIL. Wait for sandbox initialization
 before GREEN observations, and record failures when state is unavailable. Two empty
 state objects cannot prove a read-only operation preserved state.
 

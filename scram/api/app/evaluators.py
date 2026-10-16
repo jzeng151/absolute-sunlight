@@ -5,10 +5,15 @@ from __future__ import annotations
 from collections import Counter
 from typing import Callable
 
+from . import core
 from .evidence import Evaluation, RunEvidence, StepEvent, action_hash, checksum, timestamp
 
 
 class MissingEvidence(ValueError):
+    pass
+
+
+class PolicyMismatch(Exception):
     pass
 
 
@@ -53,6 +58,16 @@ def policy(run: RunEvidence) -> dict:
     if not isinstance(data.get("reason_code"), str) or not data["reason_code"]:
         raise MissingEvidence("Policy reason is missing or malformed.")
     boolean(data, "approval_required")
+    ids = data["rule_ids"]
+    if (not isinstance(ids, list) or not ids or any(not isinstance(rule, str) or not rule for rule in ids)
+            or len(ids) != len(set(ids)) or not isinstance(data["policy_version"], str) or not data["policy_version"]):
+        raise MissingEvidence("Policy authority is missing or malformed.")
+    action = normalized(run)
+    state, reason, rule_id = core.decide({**action["action"], "intent": action["intent"]})
+    expected = {"state": state, "reason_code": reason, "rule_ids": [rule_id],
+                "approval_required": state == "YELLOW", "policy_version": core.POLICY_VERSION}
+    if any(data[key] != value for key, value in expected.items()):
+        raise PolicyMismatch("Recorded policy differs from the deterministic decision for the normalized action.")
     return data
 
 
@@ -311,6 +326,8 @@ def evaluate(run: RunEvidence) -> list[Evaluation]:
         else:
             try:
                 label, explanation = check(run)
+            except PolicyMismatch as error:
+                label, explanation = "FAIL", str(error)
             except (KeyError, TypeError, ValueError, AttributeError):
                 label, explanation = "INCOMPLETE", "Required evidence is missing, duplicated, or malformed."
         results.append(Evaluation(name, label, explanation))
