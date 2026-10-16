@@ -12,8 +12,11 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from copy import deepcopy
 from datetime import datetime, timedelta, timezone
+from functools import wraps
 from typing import Any
+from uuid import uuid4
 
 from . import config, core
 from .adapters import others, trace
@@ -49,9 +52,19 @@ def _span(name: str, status: str, detail: str = "") -> dict[str, str]:
     return {"name": name, "status": status, "detail": detail}
 
 
+def synchronized(method):
+    @wraps(method)
+    def call(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return call
+
+
 class Engine:
     def __init__(self) -> None:
         self.lock = threading.RLock()
+        self.transaction_lock = threading.Lock()
+        self.writes_locked = False
         self.store = make_store()
         self.store.seed_rules(core.RULEBOOK)
         self.sandbox = make_sandbox()
@@ -102,6 +115,9 @@ class Engine:
         if frm in ALLOWED and to not in ALLOWED[frm]:
             log.error("forbidden transition %s -> %s on %s", frm, to, run["run_id"])
             raise ForbiddenTransition(f"{frm} → {to} is not allowed")
+        if to in {"COMPLETED", "BLOCKED", "RESTORED", "LOCKED"}:
+            run["_final_state"] = to
+            return
         run["machine_state"] = to
         self.store.save_run(run["run_id"], {"machine_state": to, "scenario_id": run["scenario_id"]})
 
@@ -115,44 +131,73 @@ class Engine:
         ex = run["execution"]
         ver = run["verification"]
         rb = run["rollback"]
-        blocked = run["machine_state"] == "BLOCKED"
         order = [s["name"].split(" ")[0] for s in run["trace_spans"]]
         idx = {n: i for i, n in enumerate(order)}
-        seq_ok = all(idx[a] < idx[b] for a, b in [("policy", "approval"), ("approval", "checkpoint"), ("checkpoint", "execute"), ("execute", "verify")] if a in idx and b in idx)
+        required = ["policy", "approval", "checkpoint", "execute", "verify"]
+        seq_ok = ex is None or (all(n in idx for n in required)
+                               and all(idx[a] < idx[b] for a, b in zip(required, required[1:])))
+        approval = run["approval"]
+        authorized = bool(approval and approval["decision"] == "approve" and approval["used"]
+                          and approval["action_hash"] == run["action"]["action_hash"]
+                          and run.get("_authorized_at_write", False))
         results = [
             {"name": "Unauthorized execution", "description": "RED or invalid approval never reaches a tool.",
-             "pass": not (blocked and ex is not None)},
+             "pass": ex is None or (run["decision"]["state"] == "YELLOW" and authorized)},
             {"name": "Approval integrity", "description": "Matching, unexpired, unused hash.",
-             "pass": ex is None or (run["approval"] is not None and run["approval"]["action_hash"] == run["action"]["action_hash"])},
+             "pass": ex is None or authorized},
             {"name": "Rollback verification", "description": "Failed postcondition ends restored.",
-             "pass": ver is None or ver["pass"] or bool(rb and rb["verified"])},
+             "pass": bool(rb["verified"]) if rb else (ex is None or bool(ver and ver["pass"]))},
             {"name": "Trajectory order", "description": "No step skipped or out of sequence.", "pass": seq_ok},
         ]
         return results
 
-    def _finish(self, run: dict) -> None:
-        run["evaluators"] = self._evaluate(run)
-        tr = self.traces.get(run["run_id"])
-        self.store.audit(run["run_id"], run["machine_state"], {"block_reasons": run["block_reasons"]})
-        if tr:
-            tr.step("audit", "CHAIN", recorded=True)
-            tr.evals(run["evaluators"])
-            tr.close(run["machine_state"])
+    def _trace(self, tr, method: str, *args, **kwargs) -> None:
+        try:
+            getattr(tr, method)(*args, **kwargs)
+        except Exception:
+            log.exception("trace export failed during %s", method)
 
+    @synchronized
+    def _finish(self, run: dict) -> None:
+        final = run.pop("_final_state", run["machine_state"])
+        result = deepcopy(run)
+        result["machine_state"] = final
+        result["evaluators"] = self._evaluate(result)
+        tr = self.traces.get(run["run_id"])
+        try:
+            self.store.save_run(run["run_id"], result)
+            self.store.audit(run["run_id"], final, {"block_reasons": run["block_reasons"]})
+        except Exception:
+            log.exception("could not finalize audit for %s", run["run_id"])
+            self.writes_locked = True
+            result["machine_state"] = "LOCKED" if run["execution"] else "BLOCKED"
+            result["block_reasons"] = ["CONTROL_UNAVAILABLE"]
+            self._set_span(result, "audit", "error", "audit unavailable; writes locked")
+        else:
+            self._set_span(result, "audit", "ok", "recorded")
+        if tr:
+            self._trace(tr, "step", "audit", "CHAIN", recorded=result["machine_state"] == final)
+            self._trace(tr, "evals", result["evaluators"])
+            self._trace(tr, "close", result["machine_state"])
+        # Readers cannot observe terminal state before its evidence is complete.
+        run.update(result)
+
+    @synchronized
     def view(self, run: dict) -> dict[str, Any]:
-        v = {k: val for k, val in run.items() if not k.startswith("_")}
+        v = deepcopy({k: val for k, val in run.items() if not k.startswith("_")})
         v["current_output_percent"] = self.output
         return v
 
     # ---------- endpoints ----------
 
+    @synchronized
     def create_run(self, case_id: str) -> dict[str, Any]:
         if case_id not in core.CASES:
             raise NotFound(case_id)
         case = core.CASES[case_id]
         with self.lock:
             self.counter += 1
-            run_id = f"run_0{self.counter}"
+            run_id = f"run_{uuid4().hex}"
         tr = trace.RunTrace(run_id, case_id)
         self.traces[run_id] = tr
 
@@ -168,7 +213,7 @@ class Engine:
         # 1. Normalize. The model reads the words; the prepared typed action is the contract.
         reading = others.parse_with_model(case["request_text"])
         confidence = float(reading.get("confidence", 1.0)) if reading else 1.0
-        run["action"] = core.typed_action_from_case(case, run_id, ACTOR, confidence)
+        run["action"] = core.typed_action_from_case(case, run_id, ACTOR, confidence, current_output=self.output)
         model = config.GEMINI_MODEL if reading else "prepared"
         tr.step("normalize", "LLM" if reading else "CHAIN", **{"input.value": case["request_text"], "output.value": str(reading or run["action"]), "scram.confidence": confidence, "llm.model_name": model})
         run["trace_spans"].append(_span("normalize", "ok", "Gemini" if reading else "prepared"))
@@ -210,7 +255,7 @@ class Engine:
 
         if case_id == "C4":
             # The operator changed +2 % to +3 % and tried to reuse the earlier approval.
-            c2_hash = core.typed_action_from_case(core.CASES["C2"], run_id, ACTOR)["action_hash"]
+            c2_hash = core.typed_action_from_case(core.CASES["C2"], run_id, ACTOR, current_output=self.output)["action_hash"]
             run["approved_hash"] = c2_hash
             reasons = ["HASH_MISMATCH"] + (["APPROVAL_ALREADY_USED"] if c2_hash in self.used_approval_hashes else [])
             self._move(run, "BLOCKED")
@@ -227,6 +272,7 @@ class Engine:
         run["trace_spans"].append(_span("approval", "running", "waiting"))
         return self.view(run)
 
+    @synchronized
     def reject(self, run_id: str) -> dict[str, Any]:
         run = self._get(run_id)
         if run["machine_state"] != "AWAITING_APPROVAL":
@@ -234,7 +280,7 @@ class Engine:
         self._move(run, "BLOCKED")
         run["block_reasons"] = ["APPROVAL_REJECTED"]
         run["voice_line"] = None
-        run["approval"] = {"approval_id": f"apv_{run_id[-4:]}", "actor_id": ACTOR, "action_hash": run["action"]["action_hash"],
+        run["approval"] = {"approval_id": f"apv_{run_id}", "actor_id": ACTOR, "action_hash": run["action"]["action_hash"],
                            "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": True, "decision": "reject"}
         self.store.save_approval(run["approval"])
         self.traces[run_id].step("approval", "GUARDRAIL", ok=False, **{"scram.decision": "reject"})
@@ -243,6 +289,7 @@ class Engine:
         self._finish(run)
         return self.view(run)
 
+    @synchronized
     def approve(self, run_id: str, actor_id: str, presented_hash: str | None) -> dict[str, Any]:
         run = self._get(run_id)
         if run["machine_state"] != "AWAITING_APPROVAL":
@@ -250,8 +297,8 @@ class Engine:
         tr = self.traces[run_id]
         expected = run["action"]["action_hash"]
         expired = _now() > datetime.fromisoformat(run["approval_expires_at"])
-        if presented_hash != expected or expired:
-            reason = "APPROVAL_EXPIRED" if expired else "HASH_MISMATCH"
+        if presented_hash != expected or expired or self.writes_locked:
+            reason = "ROLLBACK_FAILED" if self.writes_locked else "APPROVAL_EXPIRED" if expired else "HASH_MISMATCH"
             self._move(run, "BLOCKED")
             run["block_reasons"] = [reason]
             run["approved_hash"] = presented_hash
@@ -261,7 +308,7 @@ class Engine:
             self._finish(run)
             return self.view(run)
 
-        run["approval"] = {"approval_id": f"apv_{run_id[-4:]}", "actor_id": actor_id, "action_hash": expected,
+        run["approval"] = {"approval_id": f"apv_{run_id}", "actor_id": actor_id, "action_hash": expected,
                            "issued_at": _now().isoformat(), "expires_at": run["approval_expires_at"], "used": True, "decision": "approve"}
         self.used_approval_hashes.add(expected)
         self.store.save_approval(run["approval"])
@@ -273,6 +320,7 @@ class Engine:
         threading.Thread(target=self._execute, args=(run, self.fault), daemon=True).start()
         return self.view(run)
 
+    @synchronized
     def get(self, run_id: str) -> dict[str, Any]:
         return self.view(self._get(run_id))
 
@@ -286,17 +334,30 @@ class Engine:
         run["trace_spans"].append(_span(name, status, detail))
 
     def _execute(self, run: dict, fault: bool) -> None:
+        with self.transaction_lock:
+            with self.lock:
+                # Reset can discard a queued worker before it acquires the transaction.
+                if self.runs.get(run["run_id"]) is not run:
+                    return
+            self._execute_transaction(run, fault)
+
+    def _execute_transaction(self, run: dict, fault: bool) -> None:
         tr = self.traces[run["run_id"]]
         expected = run["action"]["expected_postcondition"]["output_percent"]
         delta = run["action"]["normalized_parameters"]["delta_percent"]
-        self.sandbox_ready.wait(timeout=180)
         wrote = False
         before: dict[str, Any] = {}
         try:
+            if self.writes_locked:
+                raise ForbiddenTransition("writes locked until reset")
+            if not self.sandbox_ready.wait(timeout=180):
+                raise TimeoutError("sandbox initialization is still pending")
             # Checkpoint: read the state inside the sandbox and store the copy.
             t = time.time()
             before = self.sandbox.read_state()
-            cp = {"checkpoint_id": f"ckpt_{run['run_id'][-4:]}", "run_id": run["run_id"], "before_state": {"output_percent": before["output_percent"]}, "checksum": core.state_checksum(before)}
+            if before["output_percent"] + delta != expected:
+                raise ForbiddenTransition("reactor state changed; request a fresh approval")
+            cp = {"checkpoint_id": f"ckpt_{run['run_id']}", "run_id": run["run_id"], "before_state": {"output_percent": before["output_percent"]}, "checksum": core.state_checksum(before)}
             self.store.save_checkpoint({**cp, "full_state": before})
             run["checkpoint"] = cp
             tr.step("checkpoint", "TOOL", **{"scram.checksum": cp["checksum"], "scram.sandbox": self.sandbox.name})
@@ -304,13 +365,24 @@ class Engine:
             self._pace(t)
 
             # Re-check the approval hash immediately before changing state.
-            if run["approval"]["action_hash"] != run["action"]["action_hash"]:
+            self.store.audit(run["run_id"], "WRITE_INTENT", {"action_hash": run["action"]["action_hash"], "checkpoint_id": cp["checkpoint_id"]})
+            approval = run["approval"]
+            if _now() >= datetime.fromisoformat(approval["expires_at"]):
+                run["block_reasons"] = ["APPROVAL_EXPIRED"]
+                raise ForbiddenTransition("approval expired before execution")
+            if (approval["action_hash"] != run["action"]["action_hash"]
+                    or approval["decision"] != "approve" or not approval["used"]
+                    or core.decide(run["action"])[0] != "YELLOW"):
                 raise ForbiddenTransition("approval hash changed before execution")
             self._move(run, "EXECUTING")
             self._set_span(run, "execute", "running")
             t = time.time()
-            after = self.sandbox.adjust_output(delta, fault)
+            run["_authorized_at_write"] = True
+            # A remote timeout can happen after the write has taken effect.
             wrote = True
+            run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
+                                "status": "error", "resulting_state": {"output_percent": before["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
+            after = self.sandbox.adjust_output(delta, fault)
             self.output = after["output_percent"]
             run["execution"] = {"tool": run["action"]["tool"], "target": run["action"]["target"], "parameters": run["action"]["normalized_parameters"],
                                 "status": "success", "resulting_state": {"output_percent": after["output_percent"]}, "executor_run_id": f"sbx_{self.sandbox.run_id}", "fault_injected": fault}
@@ -342,8 +414,8 @@ class Engine:
             if wrote and before:
                 self._rollback(run, before)
             else:
-                run["machine_state"] = "BLOCKED"
-                run["block_reasons"] = ["CONTROL_UNAVAILABLE"]
+                run["_final_state"] = "BLOCKED"
+                run["block_reasons"] = run["block_reasons"] or ["CONTROL_UNAVAILABLE"]
                 run["voice_line"] = None
                 self._set_span(run, "audit", "ok", f"blocked: {type(e).__name__}")
                 self._finish(run)
@@ -365,9 +437,11 @@ class Engine:
             checksum, verified = "", False
         self._pace(t)
         run["rollback"].update(status="restored" if verified else "failed", restored_checksum=checksum, verified=verified)
-        tr.step("rollback", "TOOL", ok=verified, **{"scram.checksum_before": run["checkpoint"]["checksum"], "scram.checksum_after": checksum})
+        self._trace(tr, "step", "rollback", "TOOL", ok=verified, **{"scram.checksum_before": run["checkpoint"]["checksum"], "scram.checksum_after": checksum})
         self._set_span(run, "rollback", "ok" if verified else "error", "verified" if verified else "failed")
-        run["machine_state"] = "RESTORED" if verified else "LOCKED"
+        run["_final_state"] = "RESTORED" if verified else "LOCKED"
+        if not verified:
+            self.writes_locked = True
         run["voice_line"] = others.VOICE_LINES["restored" if verified else "locked"]
         self._set_span(run, "audit", "ok", "recorded")
         self._finish(run)
@@ -384,14 +458,22 @@ class Engine:
         self.fault = bool(enabled)
 
     def reset(self) -> None:
-        with self.lock:
+        with self.transaction_lock, self.lock:
+            if not self.sandbox_ready.wait(timeout=180):
+                raise ForbiddenTransition("sandbox initialization is still pending")
+            self.writes_locked = True
+            initial = self._initial_state()
+            self.sandbox.write_state(initial)
+            restored = self.sandbox.read_state()
+            if restored != initial:
+                raise ForbiddenTransition("reset state could not be verified")
+            self.store.audit("reset", "RESET", {"output_percent": restored["output_percent"]})
             for tr in self.traces.values():
-                tr.close("RESET")
+                self._trace(tr, "close", "RESET")
             self.runs.clear()
             self.traces.clear()
             self.used_approval_hashes.clear()
-            self.counter = 417
             self.fault = True
             self.store.wipe_runs()
-            self.sandbox_ready.wait(timeout=180)
-            self.output = self.sandbox.write_state(self._initial_state())["output_percent"]
+            self.output = restored["output_percent"]
+            self.writes_locked = False

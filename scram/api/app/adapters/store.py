@@ -35,7 +35,7 @@ class Store:
 
     def save_run(self, run_id: str, data: dict[str, Any]) -> None:
         with self._lock:
-            self.runs[run_id] = dict(data)
+            self.runs.setdefault(run_id, {}).update(data)
 
     def link_rule(self, run_id: str, rule_id: str, policy: str, reason: str) -> None:
         with self._lock:
@@ -64,7 +64,6 @@ class Store:
             self.links.clear()
             self.approvals.clear()
             self.checkpoints.clear()
-            self.audit_log.clear()
 
 
 def make_store() -> Store:
