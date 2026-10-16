@@ -91,7 +91,7 @@ class Engine:
             "surrealdb": f"{self.store.kind} ({self.store.url})",
             "elevenlabs": "key set" if config.ELEVENLABS_API_KEY else "cached clips only",
             "anchor": "off",
-            "model": "prepared actions",
+            "model": config.GEMINI_MODEL if config.GEMINI_API_KEY else "prepared actions",
             "fault": self.fault,
         }
 
@@ -165,10 +165,19 @@ class Engine:
         }
         self.runs[run_id] = run
 
-        # 1. Normalize. The prepared typed action is the contract.
-        run["action"] = core.typed_action_from_case(case, run_id, ACTOR)
-        tr.step("normalize", "CHAIN", **{"input.value": case["request_text"], "output.value": str(run["action"]), "scram.confidence": 1.0, "llm.model_name": "prepared"})
-        run["trace_spans"].append(_span("normalize", "ok", "prepared"))
+        # 1. Normalize. The model reads the words; the prepared typed action is the contract.
+        reading = others.parse_with_model(case["request_text"])
+        confidence = float(reading.get("confidence", 1.0)) if reading else 1.0
+        run["action"] = core.typed_action_from_case(case, run_id, ACTOR, confidence)
+        model = config.GEMINI_MODEL if reading else "prepared"
+        tr.step("normalize", "LLM" if reading else "CHAIN", **{"input.value": case["request_text"], "output.value": str(reading or run["action"]), "scram.confidence": confidence, "llm.model_name": model})
+        run["trace_spans"].append(_span("normalize", "ok", "Gemini" if reading else "prepared"))
+        if confidence < config.PARSE_MIN_CONFIDENCE:
+            run["machine_state"] = "BLOCKED"
+            run["block_reasons"] = ["PARSE_UNCERTAIN"]
+            run["decision"] = {"run_id": run_id, "policy_version": core.POLICY_VERSION, "rule_ids": [], "state": "RED", "reason_code": "PARSE_UNCERTAIN", "reversible": False, "approval_required": False}
+            self._finish(run)
+            return self.view(run)
 
         # 2. Rule and policy — deterministic, never the model.
         state, reason, rule_id = core.decide(run["action"])

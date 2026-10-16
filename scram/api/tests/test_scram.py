@@ -90,3 +90,21 @@ def test_reject_and_double_approve():
     v = client.post("/api/runs", json={"case_id": "C2"}).json()
     assert client.post(f"/api/runs/{v['run_id']}/reject").json()["block_reasons"] == ["APPROVAL_REJECTED"]
     assert client.post(f"/api/runs/{v['run_id']}/approve", json={"actor_id": "op", "action_hash": v["action"]["action_hash"]}).status_code == 409
+
+
+def test_gemini_key_never_in_url(monkeypatch):
+    import httpx
+
+    from app.adapters import others
+
+    seen = {}
+
+    def fake_post(url, **kw):
+        seen.update(url=url, **kw)
+        raise httpx.ConnectError("offline")
+
+    monkeypatch.setattr(config, "GEMINI_API_KEY", "secret-key")
+    monkeypatch.setattr(httpx, "post", fake_post)
+    assert others.parse_with_model("Increase output by 2%") is None
+    assert "secret-key" not in seen["url"] and "params" not in seen
+    assert seen["headers"]["x-goog-api-key"] == "secret-key"
