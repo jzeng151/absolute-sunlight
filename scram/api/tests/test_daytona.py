@@ -213,6 +213,7 @@ def test_failed_remote_rollback_locks_writes_until_verified_reset(reactor, sdk, 
         reactor.reset()
     assert reactor.writes_locked
     assert reactor.output == reactor.sandbox.read_state()["output_percent"]
+    assert reactor.write_lock_reason == "ROLLBACK_FAILED"
     monkeypatch.setattr(sdk, "code_run", original)
     reactor.reset()
     assert not reactor.writes_locked and reactor.sandbox.read_state() == INITIAL
@@ -314,8 +315,13 @@ def test_app_lifespan_cleans_up_executor(monkeypatch):
     from app import main
 
     calls = []
-    monkeypatch.setattr(main.engine, "close", lambda: calls.append("closed"))
     with TestClient(main.app) as client:
+        current = main._engine()
+        close = current.close
+        def tracked_close():
+            close()
+            calls.append("closed")
+        monkeypatch.setattr(current, "close", tracked_close)
         assert client.get("/api/health").status_code == 200
     assert calls == ["closed"]
 

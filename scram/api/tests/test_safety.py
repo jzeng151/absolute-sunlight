@@ -296,11 +296,12 @@ def test_executor_cannot_mutate_a_run_during_a_snapshot(engine, monkeypatch):
 
 def test_reset_conflict_is_http_409(monkeypatch):
     from fastapi.testclient import TestClient
-    from app.main import app, engine
+    from app import main
     def conflict():
         raise ForbiddenTransition("sandbox not ready")
-    monkeypatch.setattr(engine, "reset", conflict)
-    response = TestClient(app, raise_server_exceptions=False).post("/api/reset")
+    with TestClient(main.app, raise_server_exceptions=False) as client:
+        monkeypatch.setattr(main._engine(), "reset", conflict)
+        response = client.post("/api/reset")
     assert response.status_code == 409
 
 

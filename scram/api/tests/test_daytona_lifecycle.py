@@ -1,5 +1,7 @@
 """Lifecycle tests use a fake client and make no Daytona requests."""
 import threading
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -9,6 +11,19 @@ from fastapi.testclient import TestClient
 from app import config
 from app.adapters.sandbox import DaytonaSandbox, LocalSandbox
 from app.engine import Engine
+
+
+def test_import_does_not_construct_engine_or_remote_sandbox():
+    code = '''
+from unittest.mock import Mock
+import app.engine
+constructor = Mock(side_effect=AssertionError("Engine created during import"))
+app.engine.Engine = constructor
+import app.main
+constructor.assert_not_called()
+'''
+    result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
 
 
 def test_daytona_disables_idle_stop_and_closes_client(monkeypatch):
@@ -94,22 +109,36 @@ def test_health_waits_for_successful_initialization(monkeypatch):
 
 
 def test_shutdown_closes_the_engine(monkeypatch):
-    from app.main import app, engine
-    close = Mock()
-    monkeypatch.setattr(engine, "close", close, raising=False)
-    with TestClient(app):
-        pass
+    from app import main
+    with TestClient(main.app):
+        current = main._engine()
+        close = Mock(wraps=current.close)
+        monkeypatch.setattr(current, "close", close)
     close.assert_called_once()
+    assert current.closed
+    assert main.engine is None
 
 
 def test_repeated_lifespans_create_a_working_engine(monkeypatch):
     import app.main as main
-    monkeypatch.setattr(main, "engine", Engine())
+    instances = []
     for _ in range(2):
         with TestClient(main.app) as client:
+            instances.append(main._engine())
             response = client.post("/api/runs", json={"case_id": "C1"})
             assert response.status_code == 200
             assert response.json()["machine_state"] == "COMPLETED"
+    assert instances[0] is not instances[1]
+    assert all(instance.closed for instance in instances)
+
+
+def test_requests_outside_lifespan_do_not_start_engine(monkeypatch):
+    import app.main as main
+    constructor = Mock(side_effect=AssertionError("unexpected engine"))
+    monkeypatch.setattr(main, "Engine", constructor)
+    response = TestClient(main.app).get("/api/health")
+    assert response.status_code == 503
+    constructor.assert_not_called()
 
 
 def test_failed_initialization_cleans_up_remote_sandbox(monkeypatch):
