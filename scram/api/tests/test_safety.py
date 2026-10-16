@@ -158,8 +158,10 @@ def test_concurrent_approvals_cannot_share_checkpoint(engine, monkeypatch):
     monkeypatch.setattr(engine.sandbox, "adjust_output", adjust)
     engine.approve(first["run_id"], "op", first["action"]["action_hash"])
     assert entered.wait(2)
-    engine.approve(second["run_id"], "op", second["action"]["action_hash"])
+    approver = threading.Thread(target=lambda: engine.approve(second["run_id"], "op", second["action"]["action_hash"]))
+    approver.start()
     release.set()
+    approver.join(2)
     a, b = settled(engine, first), settled(engine, second)
     assert a["machine_state"] == "COMPLETED"
     assert b["machine_state"] == "BLOCKED"
@@ -202,8 +204,7 @@ def test_rejected_intent_cannot_be_approved_after_persistence_failure(engine, mo
     v = engine.create_run("C2")
     save = engine.store.save_approval
     monkeypatch.setattr(engine.store, "save_approval", lambda *a: (_ for _ in ()).throw(OSError("offline")))
-    with pytest.raises(OSError):
-        engine.reject(v["run_id"])
+    assert engine.reject(v["run_id"])["machine_state"] == "BLOCKED"
     monkeypatch.setattr(engine.store, "save_approval", save)
     with pytest.raises(ForbiddenTransition):
         engine.approve(v["run_id"], "op", v["action"]["action_hash"])
@@ -261,18 +262,16 @@ def test_audit_lock_retains_control_unavailable_reason(engine, monkeypatch):
 
 def test_executor_cannot_mutate_a_run_during_a_snapshot(engine, monkeypatch):
     import app.engine as module
-    adjusting, return_response = threading.Event(), threading.Event()
+    paused, resume = threading.Event(), threading.Event()
     snapshot_started, release_snapshot = threading.Event(), threading.Event()
-    original_adjust = engine.sandbox.adjust_output
-    def adjust(*args):
-        result = original_adjust(*args)
-        adjusting.set()
-        assert return_response.wait(2)
-        return result
-    monkeypatch.setattr(engine.sandbox, "adjust_output", adjust)
+    def pause_after_dispatch(_):
+        if engine.output == 74:
+            paused.set()
+            assert resume.wait(2)
+    monkeypatch.setattr(engine, "_pace", pause_after_dispatch)
     v = engine.create_run("C2")
     engine.approve(v["run_id"], "op", v["action"]["action_hash"])
-    assert adjusting.wait(2)
+    assert paused.wait(2)
     original_copy = module.deepcopy
     def copy(value):
         if threading.current_thread().name == "snapshot-reader":
@@ -285,11 +284,11 @@ def test_executor_cannot_mutate_a_run_during_a_snapshot(engine, monkeypatch):
     try:
         assert snapshot_started.wait(2)
         before = original_copy(engine.runs[v["run_id"]])
-        return_response.set()
+        resume.set()
         time.sleep(0.05)
         assert engine.runs[v["run_id"]] == before
     finally:
-        return_response.set()
+        resume.set()
         release_snapshot.set()
         reader.join(2)
     assert settled(engine, v)["machine_state"] == "COMPLETED"
@@ -343,3 +342,134 @@ def test_new_global_lock_is_checked_immediately_before_write(engine, monkeypatch
     result = execute(engine)
     assert result["machine_state"] == "BLOCKED"
     assert result["execution"] is None
+
+
+def test_stale_approval_reports_state_change(engine):
+    stale = engine.create_run("C2")
+    execute(engine)
+    result = execute(engine, stale)
+    assert result["block_reasons"] == ["STATE_CHANGED"]
+    assert engine.store.audit_log[-1]["detail"]["block_reasons"] == ["STATE_CHANGED"]
+
+
+@pytest.mark.parametrize("failure", ["write_response", "first_read"])
+def test_ambiguous_restore_uses_recovery_checksum(engine, monkeypatch, failure):
+    engine.set_fault(True)
+    write, read = engine.sandbox.write_state, engine.sandbox.read_state
+    restoring = False
+    def restore(state):
+        nonlocal restoring
+        restoring = True
+        result = write(state)
+        if failure == "write_response":
+            raise TimeoutError("restore response lost")
+        return result
+    def read_back():
+        nonlocal restoring
+        if restoring and failure == "first_read":
+            restoring = False
+            raise TimeoutError("first read lost")
+        return read()
+    monkeypatch.setattr(engine.sandbox, "write_state", restore)
+    monkeypatch.setattr(engine.sandbox, "read_state", read_back)
+    result = execute(engine)
+    assert result["machine_state"] == "RESTORED"
+    assert result["rollback"]["verified"]
+    assert result["rollback"]["restored_checksum"] == result["checkpoint"]["checksum"]
+    assert not engine.writes_locked
+
+
+def test_failed_audit_preserves_failed_rollback_cause(engine, monkeypatch):
+    engine.set_fault(True)
+    monkeypatch.setattr(engine.sandbox, "write_state", lambda *a: (_ for _ in ()).throw(OSError("restore offline")))
+    monkeypatch.setattr(engine.store, "finalize_run", lambda *a: (_ for _ in ()).throw(OSError("audit offline")))
+    result = execute(engine)
+    assert engine.write_lock_reason == "ROLLBACK_FAILED"
+    assert "ROLLBACK_FAILED" in result["block_reasons"]
+    assert "CONTROL_UNAVAILABLE" in result["block_reasons"]
+    assert "ROLLBACK_FAILED" in engine.pending_finalizations[result["run_id"]]["block_reasons"]
+
+
+@pytest.mark.parametrize("failure", ["approval", "trace", "approval_and_audit"])
+def test_rejection_finishes_despite_evidence_failure(engine, monkeypatch, failure):
+    v = engine.create_run("C2")
+    def offline(*args, **kwargs):
+        raise OSError("offline")
+    if failure.startswith("approval"):
+        monkeypatch.setattr(engine.store, "save_approval", offline)
+    if failure == "trace":
+        monkeypatch.setattr(engine.traces[v["run_id"]], "step", offline)
+    if failure == "approval_and_audit":
+        monkeypatch.setattr(engine.store, "finalize_run", offline)
+    result = engine.reject(v["run_id"])
+    assert result["machine_state"] == "BLOCKED"
+    assert "APPROVAL_REJECTED" in result["block_reasons"]
+    with pytest.raises(ForbiddenTransition):
+        engine.approve(v["run_id"], "op", v["action"]["action_hash"])
+    if failure == "approval_and_audit":
+        assert v["run_id"] in engine.pending_finalizations
+    else:
+        saved = engine.store.runs[v["run_id"]]
+        assert saved["machine_state"] == "BLOCKED"
+        assert saved["approval"]["decision"] == "reject"
+
+
+def test_reset_audit_failure_does_not_leave_stale_output(engine, monkeypatch):
+    execute(engine)
+    monkeypatch.setattr(engine.store, "audit", lambda *a: (_ for _ in ()).throw(OSError("offline")))
+    with pytest.raises(OSError):
+        engine.reset()
+    assert engine.output == engine.sandbox.read_state()["output_percent"] == 72
+    assert engine.writes_locked
+
+
+def test_repeated_approval_does_not_narrate_old_target(engine):
+    execute(engine)
+    result = engine.create_run("C2")
+    assert result["action"]["expected_postcondition"]["output_percent"] == 76
+    assert result["voice_line"] is None
+
+
+def test_expired_dispatch_uses_valid_abort_transition(engine, monkeypatch):
+    from app.engine import ALLOWED
+    save = engine.store.save_run
+    states = []
+    def expire_after_persist(run_id, data):
+        states.append(data["machine_state"])
+        save(run_id, data)
+        if data["machine_state"] == "EXECUTING":
+            engine.runs[run_id]["approval"]["expires_at"] = (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()
+    monkeypatch.setattr(engine.store, "save_run", expire_after_persist)
+    result = execute(engine)
+    assert result["machine_state"] == "BLOCKED"
+    assert result["execution"] is None
+    assert all(b in ALLOWED[a] for a, b in zip(states, states[1:]))
+    assert next(s for s in result["trace_spans"] if s["name"] == "execute")["status"] == "skipped"
+
+
+def test_audit_lock_cannot_interleave_with_dispatch(engine, monkeypatch):
+    other = engine.create_run("C2")
+    started, finished = threading.Event(), threading.Event()
+    audit = engine.store.audit
+    def fail_other(run_id, *args, **kwargs):
+        if run_id == other["run_id"]:
+            raise OSError("other request audit failed")
+        return audit(run_id, *args, **kwargs)
+    monkeypatch.setattr(engine.store, "audit", fail_other)
+    def reject_other():
+        started.set()
+        engine.reject(other["run_id"])
+        finished.set()
+    worker = threading.Thread(target=reject_other)
+    adjust = engine.sandbox.adjust_output
+    interleaved = []
+    def dispatch(*args):
+        worker.start()
+        assert started.wait(1)
+        interleaved.append(finished.wait(0.05))
+        return adjust(*args)
+    monkeypatch.setattr(engine.sandbox, "adjust_output", dispatch)
+    execute(engine)
+    worker.join(2)
+    assert finished.is_set()
+    assert interleaved == [False]
