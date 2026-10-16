@@ -181,16 +181,20 @@ def test_reset_preserves_audit_and_never_reuses_identity(engine):
 @pytest.mark.parametrize("missing", ["policy", "approval", "checkpoint", "execute", "verify"])
 def test_missing_required_span_fails_trajectory(engine, missing):
     result = execute(engine)
-    result["trace_spans"] = [s for s in result["trace_spans"] if s["name"].split(" ")[0] != missing]
-    assert not next(e for e in engine._evaluate(result) if e["name"] == "Trajectory order")["pass"]
+    from app.evaluators import evaluate
+    evidence = engine.traces[result["run_id"]].evidence
+    evidence.events = [event for event in evidence.events if event.step != missing]
+    assert next(e for e in evaluate(evidence) if e.name == "Trajectory order").label != "PASS"
 
 
 @pytest.mark.parametrize("state", ["COMPLETED", "RESTORED", "LOCKED"])
 def test_unauthorized_execution_fails_regardless_of_final_state(engine, state):
     result = execute(engine)
-    result["machine_state"] = state
-    result["decision"]["state"] = "RED"
-    assert not engine._evaluate(result)[0]["pass"]
+    from app.evaluators import evaluate
+    evidence = engine.traces[result["run_id"]].evidence
+    evidence.terminal_state = state
+    next(event for event in evidence.events if event.step == "policy").data["state"] = "RED"
+    assert evaluate(evidence)[0].label == "FAIL"
 
 
 def test_unverified_recovery_without_verification_fails_evaluation(engine):

@@ -5,8 +5,10 @@ doesn't know, this fails before the screen does.
 """
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from threading import Event
 
 import pytest
 from fastapi.testclient import TestClient
@@ -21,10 +23,10 @@ TYPES = (Path(__file__).resolve().parents[2] / "web" / "src" / "types.ts").read_
 MOVING = {"CHECKPOINTING", "EXECUTING", "VERIFYING", "ROLLING_BACK"}
 
 
-def fields(interface: str) -> set[str]:
+def fields(interface: str, *, required_only: bool = False) -> set[str]:
     body = re.search(rf"export interface {interface} \{{(.*?)\n\}}", TYPES, re.S).group(1)
     body = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
-    return set(re.findall(r"^\s+(\w+)\??:", body, re.M))
+    return {name for name, optional in re.findall(r"^\s+(\w+)(\??):", body, re.M) if not required_only or not optional}
 
 
 def literals(type_name: str) -> set[str]:
@@ -50,7 +52,10 @@ def assert_matches_types(v: dict) -> None:
         assert set(span) == fields("TraceSpan")
         assert span["status"] in field_literals("TraceSpan", "status")
     for ev in v["evaluators"]:
-        assert set(ev) == fields("Evaluator")
+        assert fields("Evaluator", required_only=True) <= set(ev) <= fields("Evaluator")
+        assert ev["label"] in {"PASS", "FAIL", "N/A", "INCOMPLETE"}
+        assert ev["pass"] == (ev["label"] == "PASS")
+        assert ev["score"] == {"PASS": 1.0, "FAIL": 0.0, "N/A": None, "INCOMPLETE": None}[ev["label"]]
     assert v["scenario_id"] in literals("CaseId")
     assert v["machine_state"] in literals("MachineState")
     assert set(v["block_reasons"]) <= literals("ReasonCode")
@@ -106,12 +111,12 @@ def test_every_demo_state_matches_types_ts():
     assert {"COMPLETED", "BLOCKED", "AWAITING_APPROVAL", "RESTORED"} <= states
 
 
-def test_all_four_evaluators_pass_on_every_settled_run():
+def test_applicable_evaluators_pass_on_healthy_demo_runs():
     for v in every_demo_state():
         if v["machine_state"] != "AWAITING_APPROVAL":
             assert [e["name"] for e in v["evaluators"]] == [
                 "Unauthorized execution", "Approval integrity", "Rollback verification", "Trajectory order"]
-            assert all(e["pass"] for e in v["evaluators"]), (v["scenario_id"], v["evaluators"])
+            assert all(e["label"] in {"PASS", "N/A"} for e in v["evaluators"]), (v["scenario_id"], v["evaluators"])
 
 
 def test_expired_approval_never_executes():
@@ -140,3 +145,47 @@ def test_baseline_and_health_shapes():
 def test_unknown_case_and_unknown_run_are_404():
     assert client.post("/api/runs", json={"case_id": "C9"}).status_code in (404, 422)
     assert client.get("/api/runs/run_nope").status_code == 404
+    assert client.get("/api/runs/run_nope/evidence").status_code == 404
+
+
+def test_evidence_endpoint_matches_run_and_survives_local_mode():
+    v = create("C3")
+    response = client.get(f"/api/runs/{v['run_id']}/evidence")
+    assert response.status_code == 200
+    result = response.json()
+    assert result["evaluators"] == v["evaluators"]
+    assert result["export_status"] == "local"
+    assert result["evidence"]["executor_call_count"] == 0
+    assert result["evidence"]["terminal_state"] == "BLOCKED"
+    assert [event["step"] for event in result["evidence"]["events"]] == [
+        "normalize", "rule.retrieve", "policy", "audit"]
+
+
+def test_evidence_snapshot_is_atomic_with_reset(monkeypatch):
+    v = create("C3")
+    found, release, resetting, reset_done = Event(), Event(), Event(), Event()
+    original = engine._get
+    def pause_after_lookup(run_id):
+        run = original(run_id)
+        found.set()
+        assert release.wait(3)
+        return run
+    def reset_concurrently():
+        resetting.set()
+        engine.reset()
+        reset_done.set()
+    monkeypatch.setattr(engine, "_get", pause_after_lookup)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        snapshot = pool.submit(client.get, f"/api/runs/{v['run_id']}/evidence")
+        assert found.wait(3)
+        reset = pool.submit(reset_concurrently)
+        try:
+            assert resetting.wait(3)
+            assert not reset_done.wait(0.05), "Reset cleared the run during its evidence lookup"
+        finally:
+            release.set()
+        response = snapshot.result(timeout=3)
+        reset.result(timeout=3)
+    assert response.status_code == 200
+    assert response.json()["evidence"]["run_id"] == v["run_id"]
+    assert client.get(f"/api/runs/{v['run_id']}/evidence").status_code == 404

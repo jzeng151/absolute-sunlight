@@ -49,7 +49,7 @@ def test_c1_green_no_write():
 def test_c3_red_never_executes():
     v = client.post("/api/runs", json={"case_id": "C3"}).json()
     assert v["machine_state"] == "BLOCKED" and v["block_reasons"] == ["BOUNDARY_EXCEEDED"] and v["execution"] is None
-    assert all(e["pass"] for e in v["evaluators"])
+    assert [e["label"] for e in v["evaluators"]] == ["PASS", "N/A", "N/A", "PASS"]
 
 
 def test_c2_fault_rolls_back():

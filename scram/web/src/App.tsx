@@ -26,15 +26,17 @@ export default function App() {
   const mode = modeOf(run);
   const running = !!run && TRANSIENT.has(run.machine_state);
 
-  // Follow a run through its transient states (checkpoint → execute → verify → rollback).
+  // A terminal state can arrive while its audit write and evaluations are finishing.
   useEffect(() => {
-    if (!run || !TRANSIENT.has(run.machine_state)) return;
+    const awaitingEvidence = run && ['COMPLETED', 'BLOCKED', 'RESTORED', 'LOCKED'].includes(run.machine_state)
+      && run.evaluators.length === 0;
+    if (!run || (!TRANSIENT.has(run.machine_state) && !awaitingEvidence)) return;
     const id = run.run_id;
     const t = setInterval(() => {
       api.getRun(id).then(setRun).catch((e: Error) => setError(e.message));
     }, POLL_MS);
     return () => clearInterval(t);
-  }, [run?.run_id, run?.machine_state]);
+  }, [run?.run_id, run?.machine_state, run?.evaluators.length]);
 
   const act = useCallback(async (fn: () => Promise<RunView | void>) => {
     setBusy(true);

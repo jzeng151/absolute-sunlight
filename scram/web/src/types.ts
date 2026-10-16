@@ -118,6 +118,10 @@ export interface Evaluator {
   name: string;
   description: string;
   pass: boolean;
+  /** Live backend evaluations distinguish inapplicable and missing evidence. */
+  label?: 'PASS' | 'FAIL' | 'N/A' | 'INCOMPLETE';
+  score?: number | null;
+  explanation?: string;
 }
 
 /** The single object the screen renders. GET /api/runs/{id} returns this. */

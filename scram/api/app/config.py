@@ -25,7 +25,8 @@ FIXTURES = API_DIR.parent / "web" / "src" / "fixtures"  # one source of truth, s
 # Arize AX — traces and evaluators
 ARIZE_SPACE_ID = _env("ARIZE_SPACE_ID")
 ARIZE_API_KEY = _env("ARIZE_API_KEY")
-ARIZE_PROJECT = _env("ARIZE_PROJECT", "scram")
+ARIZE_PROJECT = _env("ARIZE_PROJECT", _env("ARIZE_PROJECT_NAME", "scram"))
+SCRAM_TRACE_MODE = _env("SCRAM_TRACE_MODE", "auto")
 
 # Behaviour
 STEP_SECONDS = float(_env("STEP_SECONDS", "0.9"))  # minimum pace between execution steps, for the audience
