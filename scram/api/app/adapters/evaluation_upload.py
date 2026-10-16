@@ -51,11 +51,22 @@ class EvaluationUploader:
 
                 if not self.provider.force_flush(timeout_millis=2000):
                     raise TimeoutError("Span flush timed out")
-                self.client.spans.update_evaluations(
-                    space_id=self.space_id, project_name=self.project_name,
-                    dataframe=pd.DataFrame([row]), force_http=True, timeout=5,
-                )
-                # Submission is not confirmation that AX has indexed the trace.
+                # OTLP acknowledgement can precede the span becoming queryable.
+                # Retry an unmatched ID briefly, but never claim it was updated.
+                for delay in (0, 1, 2, 4, 8):
+                    if delay and self.stopping.wait(delay):
+                        raise RuntimeError("Uploader closed before span became available")
+                    self.statuses[span_id] = "uploading"
+                    response = self.client.spans.update_evaluations(
+                        space_id=self.space_id, project_name=self.project_name,
+                        dataframe=pd.DataFrame([row]),
+                    )
+                    if int(response.get("records_updated", 0)) == 1 and not response.get("unmatched_ids"):
+                        break
+                    self.statuses[span_id] = "waiting_for_span"
+                else:
+                    raise LookupError("AX did not match the root span")
+                # Server acknowledgement is distinct from readback/index visibility.
                 self.statuses[span_id] = "evaluations_submitted"
             except Exception as error:
                 # SDK exceptions may contain credentials. Retain only the type.

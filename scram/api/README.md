@@ -66,16 +66,21 @@ evaluations use the resolved project. `SCRAM_TRACE_MODE=local` disables network 
 The existing `RunTrace` owns the root and child spans. The uploader reuses that provider;
 it never registers another tracer. After the root ends, a bounded background queue flushes
 spans and calls the SDK's [native evaluation API](https://arize-client-python.readthedocs.io/en/latest/spans.html#arize.spans.client.SpansClient.update_evaluations)
-using `context.span_id` to join results to the root. Uploads have a five-second HTTP timeout.
+using `context.span_id` to join results to the root. It uses the SDK's native Flight
+transport and checks `records_updated`; the HTTP file-upload path did not produce
+readable native evaluations during the live smoke check. Unmatched span IDs are retried
+up to five times with a total of 15 seconds of backoff.
 
 Labels are `PASS`, `FAIL`, `N/A`, and `INCOMPLETE`. Only PASS scores 1; FAIL scores 0;
 N/A and INCOMPLETE have no numeric score. The existing `pass` field remains for compatibility.
 The Audit view shows the label and explanation, and waits for evaluations after a terminal state.
 
 `GET /api/runs/{id}/evidence` returns `export_status`: `local`, `recording`, `queued`,
-`evaluations_submitted`, or `error:<type>`. Submission does not prove AX indexing; confirm
+`uploading`, `waiting_for_span`, `evaluations_submitted`, or `error:<type>`. Submission does not prove AX indexing; confirm
 the trace and evaluation columns in AX. An outage or full queue preserves local results.
-Shutdown waits briefly for the queue; abrupt shutdown can lose pending uploads.
+Shutdown waits up to two seconds for the queue. The pinned SDK does not expose a Flight
+request deadline, so a stalled request can occupy the daemon worker until it returns;
+the queue remains bounded and control execution continues. Shutdown can lose pending uploads.
 
 See [the evidence contract](../../docs/SCRAM_ARIZE_EVENT_CONTRACT.md) for backend hooks.
 Evaluators observe existing control behavior. They do not fix the core's execution, reset,

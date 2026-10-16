@@ -34,6 +34,7 @@ def test_one_existing_root_and_native_evaluation_join(engine, otel, monkeypatch)
         root_id = kwargs["dataframe"].iloc[0]["context.span_id"]
         assert any(f"{s.context.span_id:016x}" == root_id for s in exporter.get_finished_spans())
         submitted.append(kwargs)
+        return {"records_updated": "1"}
     uploader = EvaluationUploader(provider, client(upload), space_id="space", project_name="scram")
     monkeypatch.setattr(trace, "_uploader", uploader)
     try:
@@ -51,7 +52,7 @@ def test_one_existing_root_and_native_evaluation_join(engine, otel, monkeypatch)
         frame = submitted[0]["dataframe"]
         assert frame.iloc[0]["context.span_id"] == f"{root.context.span_id:016x}"
         assert frame.iloc[0]["eval.rollback_verification.score"] == 1
-        assert submitted[0]["force_http"] is True and submitted[0]["timeout"] == 5
+        assert "force_http" not in submitted[0]  # Native Flight update, not asynchronous file ingestion.
         assert run_trace.snapshot()["export_status"] == "evaluations_submitted"
     finally:
         uploader.close()
@@ -88,7 +89,7 @@ def test_slow_failed_upload_never_delays_recovery(engine, otel, monkeypatch):
         assert entered.wait(2)
         assert v["machine_state"] == "RESTORED" and v["current_output_percent"] == 72
         assert all(e["label"] == "PASS" for e in v["evaluators"])
-        assert not release.is_set()  # The HTTP request is still blocked after recovery completed.
+        assert not release.is_set()  # The AX request is still blocked after recovery completed.
         release.set()
         assert uploader.flush(3)
         snapshot = engine.traces[v["run_id"]].snapshot()
@@ -104,6 +105,7 @@ def test_queue_overflow_is_reported_without_blocking(otel):
     def upload(**kwargs):
         entered.set()
         release.wait(5)
+        return {"records_updated": "1"}
     uploader = EvaluationUploader(otel[0], client(upload), space_id="space", project_name="scram", capacity=1)
     try:
         uploader.submit("0000000000000001", [])
@@ -124,6 +126,27 @@ def test_flush_timeout_does_not_claim_evaluations_were_submitted():
         uploader.submit("0000000000000001", [])
         assert uploader.flush(3)
         assert uploader.status("0000000000000001") == "error:TimeoutError"
+    finally:
+        uploader.close()
+
+
+@pytest.mark.parametrize("eventual_match", [False, True])
+def test_native_upload_retries_unmatched_root_without_false_success(otel, eventual_match):
+    calls = []
+    def upload(**kwargs):
+        calls.append(kwargs)
+        if eventual_match and len(calls) == 2:
+            return {"records_updated": "1"}
+        return {"records_updated": "0", "unmatched_ids": ["0000000000000001"]}
+    uploader = EvaluationUploader(otel[0], client(upload), space_id="space", project_name="scram")
+    # Avoid real backoff in the unit test; the real worker still owns each request.
+    uploader.stopping.wait = lambda delay: False
+    try:
+        uploader.submit("0000000000000001", [])
+        assert uploader.flush(3)
+        expected = "evaluations_submitted" if eventual_match else "error:LookupError"
+        assert uploader.status("0000000000000001") == expected
+        assert len(calls) == (2 if eventual_match else 5)
     finally:
         uploader.close()
 
