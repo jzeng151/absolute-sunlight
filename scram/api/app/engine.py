@@ -210,15 +210,21 @@ class Engine:
         }
         self.runs[run_id] = run
 
-        # 1. Normalize. The model reads the words; the prepared typed action is the contract.
+        # 1. Normalize the model's action; only no-model mode uses the fixture.
         reading = others.parse_with_model(case["request_text"])
-        confidence = float(reading.get("confidence", 1.0)) if reading else 1.0
-        run["action"] = core.typed_action_from_case(case, run_id, ACTOR, confidence, current_output=self.output)
-        model = config.GEMINI_MODEL if reading else "prepared"
-        tr.step("normalize", "LLM" if reading else "CHAIN", **{"input.value": case["request_text"], "output.value": str(reading or run["action"]), "scram.confidence": confidence, "llm.model_name": model})
-        run["trace_spans"].append(_span("normalize", "ok", "Gemini" if reading else "prepared"))
+        using_model = reading is not None
+        try:
+            run["action"] = (core.typed_action_from_reading(reading, run_id, ACTOR, self.output) if using_model
+                             else core.typed_action_from_case(case, run_id, ACTOR, current_output=self.output))
+            confidence = run["action"]["confidence"]
+        except ValueError:
+            confidence = 0.0
+        model = config.GEMINI_MODEL if using_model else "prepared"
+        tr.step("normalize", "LLM" if using_model else "CHAIN", ok=confidence >= config.PARSE_MIN_CONFIDENCE,
+                **{"input.value": case["request_text"], "output.value": str(reading if using_model else run["action"]), "scram.confidence": confidence, "llm.model_name": model})
+        run["trace_spans"].append(_span("normalize", "ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "error", "Gemini" if using_model else "prepared"))
         if confidence < config.PARSE_MIN_CONFIDENCE:
-            run["machine_state"] = "BLOCKED"
+            run["_final_state"] = "BLOCKED"
             run["block_reasons"] = ["PARSE_UNCERTAIN"]
             run["decision"] = {"run_id": run_id, "policy_version": core.POLICY_VERSION, "rule_ids": [], "state": "RED", "reason_code": "PARSE_UNCERTAIN", "reversible": False, "approval_required": False}
             self._finish(run)
@@ -268,7 +274,11 @@ class Engine:
 
         self._move(run, "AWAITING_APPROVAL")
         run["approval_expires_at"] = (_now() + timedelta(seconds=config.APPROVAL_TTL_SECONDS)).isoformat()
-        run["voice_line"] = others.VOICE_LINES["yellow"]
+        # The cached clip specifically describes +2 to 74. Other parsed actions
+        # remain visible in the approval panel without contradictory narration.
+        run["voice_line"] = (others.VOICE_LINES["yellow"]
+                             if run["action"]["normalized_parameters"] == {"delta_percent": 2}
+                             and run["action"]["expected_postcondition"] == {"output_percent": 74} else None)
         run["trace_spans"].append(_span("approval", "running", "waiting"))
         return self.view(run)
 

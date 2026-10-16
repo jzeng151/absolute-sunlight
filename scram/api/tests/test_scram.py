@@ -105,6 +105,6 @@ def test_gemini_key_never_in_url(monkeypatch):
 
     monkeypatch.setattr(config, "GEMINI_API_KEY", "secret-key")
     monkeypatch.setattr(httpx, "post", fake_post)
-    assert others.parse_with_model("Increase output by 2%") is None
+    assert others.parse_with_model("Increase output by 2%") == {}
     assert "secret-key" not in seen["url"] and "params" not in seen
     assert seen["headers"]["x-goog-api-key"] == "secret-key"

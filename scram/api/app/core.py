@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from typing import Any
 
 from . import config
@@ -49,6 +50,8 @@ def decide(action: dict) -> tuple[str, str, str]:
 
     if tool == "disable_safety_function":
         return "RED", "SAFETY_BYPASS_FORBIDDEN", "NC-05"
+    if params.get("boundary") == "beyond_authority":
+        return "RED", "BOUNDARY_EXCEEDED", "NC-04"
     if tool == "analyze_history" and action.get("intent") == "read":
         return "GREEN", "READ_ONLY_ALLOWED", "NC-01"
     if tool == "adjust_output":
@@ -78,3 +81,39 @@ def typed_action_from_case(case: dict, run_id: str, actor_id: str, confidence: f
         "confidence": confidence,
         "action_hash": action_hash(case["tool"], REACTOR["target"], params, post),
     }
+
+
+def typed_action_from_reading(reading: Any, run_id: str, actor_id: str, current_output: float) -> dict:
+    """Validate model data before hashing the exact action policy will evaluate."""
+    if not isinstance(reading, dict):
+        raise ValueError("model reply must be an object")
+    confidence = reading.get("confidence")
+    if (type(confidence) not in (int, float) or not math.isfinite(confidence)
+            or not 0 <= confidence <= 1):
+        raise ValueError("model confidence must be finite and between zero and one")
+    tool = reading.get("tool")
+    if not isinstance(tool, str) or tool not in {"adjust_output", "analyze_history", "disable_safety_function", "unknown"}:
+        raise ValueError("model tool is missing or unsupported")
+    boundary = reading.get("beyond_boundary")
+    if type(boundary) is not bool or "delta_percent" not in reading:
+        raise ValueError("model action fields are incomplete")
+    delta = reading["delta_percent"]
+    if delta is not None and (type(delta) not in (int, float) or not math.isfinite(delta)):
+        raise ValueError("model delta must be finite")
+    params = {}
+    post = {"output_percent": current_output}
+    if tool == "adjust_output":
+        if delta is None and not boundary:
+            raise ValueError("an output adjustment needs a delta")
+        if delta is not None:
+            params["delta_percent"] = delta
+            post["output_percent"] = current_output + delta
+    elif tool == "analyze_history":
+        if delta is not None:
+            raise ValueError("a read cannot request an output change")
+        params = dict(CASES["C1"]["normalized_parameters"])
+    if boundary:
+        params["boundary"] = "beyond_authority"
+    case = {"tool": tool, "intent": "read" if tool == "analyze_history" else "write",
+            "normalized_parameters": params, "expected_postcondition": post}
+    return typed_action_from_case(case, run_id, actor_id, float(confidence))
