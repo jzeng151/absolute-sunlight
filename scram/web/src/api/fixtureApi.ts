@@ -54,6 +54,7 @@ let fault = true;
 let counter = 417;
 let usedApprovalHash: string | null = null;
 let currentOutput = REACTOR.output_percent;
+let verifiedOutput = currentOutput;
 let activeRun: string | null = null;
 let queuedRuns: string[] = [];
 let advancing = Promise.resolve();
@@ -68,7 +69,7 @@ async function typedAction(c: CaseDef, runId: string): Promise<TypedAction> {
     target: REACTOR.target,
     normalized_parameters: c.normalized_parameters as unknown as Record<string, number | string>,
     expected_postcondition: c.tool === 'adjust_output'
-      ? { output_percent: currentOutput + Number(c.normalized_parameters.delta_percent) }
+      ? { output_percent: verifiedOutput + Number(c.normalized_parameters.delta_percent) }
       : c.expected_postcondition as unknown as Record<string, number | string>
   };
   return { run_id: runId, actor_id: ACTOR, intent: c.intent, confidence: 0.97, action_hash: await actionHash(parts), ...parts };
@@ -172,6 +173,7 @@ function project(run: Internal): RunView {
   ];
   if (f) v.trace_spans.push(span('rollback', state === 'RESTORED' ? 'ok' : at >= 3 ? 'running' : 'pending', state === 'RESTORED' ? 'verified' : ''));
   if (state === 'RESTORED' || state === 'COMPLETED') {
+    verifiedOutput = currentOutput;
     v.trace_spans.push(span('audit', 'ok', 'recorded'));
     run.base = structuredClone(v);
     run.startedAt = null;
@@ -337,6 +339,7 @@ export const fixtureApi: ScramApi = {
     activeRun = null;
     queuedRuns = [];
     currentOutput = REACTOR.output_percent;
+    verifiedOutput = currentOutput;
     fault = true;
     usedApprovalHash = null;
   },
