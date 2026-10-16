@@ -8,7 +8,7 @@ FastAPI service for the SCRAM control room. Every endpoint returns the `RunView`
 ## Run
 
 ```bash
-cd scram/api
+cd api
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env          # add your keys
@@ -18,7 +18,7 @@ uvicorn app.main:app --reload --port 8000
 Then run the front end against it:
 
 ```bash
-cd scram/web
+cd web
 echo "VITE_API_MODE=live" > .env
 npm run dev
 ```
@@ -60,7 +60,7 @@ pytest -q          # includes evaluator and SDK tests; no keys or network needed
 Covers the policy truth set, RED never executing, the fault → verified rollback, clean completion,
 a wrong hash, replay after use and reject then approve (409). Evaluator tests also cover
 missing evidence, expired/reused approvals, changed actions, dishonest recovery, executor
-exceptions, and slow/failed AX uploads. CI discovers these tests under `scram/api/tests`.
+exceptions, and slow/failed AX uploads. CI discovers these tests under `api/tests`.
 
 ## Arize evaluations
 
@@ -93,7 +93,7 @@ The Flight path ignores it and converts its protobuf response to a dictionary, d
 the method's return annotation. Tests exercise the actual SDK wrapper with a fake Flight
 transport. See the [SDK implementation](https://arize-client-python.readthedocs.io/en/latest/_modules/arize/spans/client.html#SpansClient.update_evaluations).
 
-See [the evidence contract](../../docs/SCRAM_ARIZE_EVENT_CONTRACT.md) for backend hooks.
+See [the evidence contract](../docs/SCRAM_ARIZE_EVENT_CONTRACT.md) for backend hooks.
 Evaluators observe existing control behavior. This integration also rejects approval expiry
 at the execution boundary, after checkpointing, storage, and trace preparation; an approval
 is consumed only when that check succeeds. Approval evidence is exported after dispatch
@@ -127,7 +127,7 @@ dotenv loading and developer credentials.
 To check a real Daytona sandbox after setting `DAYTONA_API_KEY` in `.env`:
 
 ```bash
-cd scram/api
+cd api
 python -m scripts.daytona_smoke
 ```
 

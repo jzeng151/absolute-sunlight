@@ -11,6 +11,7 @@ from app.adapters import trace
 from app.adapters.sandbox import LocalSandbox
 from app.engine import Engine, ForbiddenTransition
 from test_evaluations import approve, data, engine, labels
+from store_helpers import stored_record
 
 
 def test_rejected_request_keeps_observed_time_across_slow_storage(engine, monkeypatch):
@@ -76,7 +77,7 @@ def test_expiry_gate_follows_slow_io_and_precedes_executor(engine, monkeypatch, 
         assert result["block_reasons"] == ["APPROVAL_EXPIRED"]
         check = data(run_trace.evidence, "approval.check")
         assert not check["valid"] and not check["consumed"]
-        assert not engine.store.approvals[result["approval"]["approval_id"]]["used"]
+        assert not stored_record(engine.store, "approval", result["approval"]["approval_id"])["used"]
 
 
 @pytest.mark.parametrize("phase", ["checkpoint", "execute", "verify", "rollback"])

@@ -307,7 +307,8 @@ class Engine:
             except Exception as error:
                 read_evidence, read_outcome = {"error_type": type(error).__name__}, "error"
             tr.step("read", "TOOL", evidence=read_evidence, outcome=read_outcome, ok=read_outcome == "ok", **{"tool.name": action["tool"], "scram.source": read["source"], "scram.url": read.get("url"), "scram.chars": read.get("chars")})
-            run["trace_spans"].append(_span("read", read_outcome, "no write" if read_outcome == "ok" else "state observation unavailable"))
+            read_status = "skipped" if read_outcome == "ok" and read["source"] == "skipped" else read_outcome
+            run["trace_spans"].append(_span("read", read_status, "no write" if read_outcome == "ok" else "state observation unavailable"))
             failed = read["source"] == "error"
             if failed:
                 run["block_reasons"] = ["CONTROL_UNAVAILABLE"]
