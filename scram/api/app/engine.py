@@ -170,6 +170,9 @@ class Engine:
         # 1. Normalize. The model reads the words; the prepared typed action is the contract.
         reading = others.parse_with_model(case["request_text"])
         confidence = float(reading.get("confidence", 1.0)) if reading else 1.0
+        if case_id == "C1" and config.ANCHOR_API_KEY:
+            case = {**case, "tool": "anchor.fetch_webpage", "target": config.ANCHOR_READ_URL,
+                    "normalized_parameters": {}, "expected_postcondition": {}}
         run["action"] = core.typed_action_from_case(case, run_id, ACTOR, confidence)
         model = config.GEMINI_MODEL if reading else "prepared"
         tr.step("normalize", "LLM" if reading else "CHAIN", **{"input.value": case["request_text"], "output.value": str(reading or run["action"]), "scram.confidence": confidence, "llm.model_name": model})
@@ -195,10 +198,14 @@ class Engine:
         run["trace_spans"].append(_span(f"policy · {state}", "error" if state == "RED" else "ok"))
 
         if state == "GREEN":
-            read = others.anchor_read() if case_id == "C1" else {"source": "skipped"}
-            tr.step("read", "TOOL", **{"tool.name": "anchor.fetch_webpage" if read["source"] == "anchor" else "analyze_history", "scram.url": read.get("url"), "scram.chars": read.get("chars")})
-            run["trace_spans"].append(_span("read", "ok", "Anchor · no write" if read["source"] == "anchor" else "no write"))
-            self._move(run, "COMPLETED")
+            action = run["action"]
+            read = others.anchor_read(action["target"]) if action["tool"] == "anchor.fetch_webpage" else {"source": "skipped"}
+            failed = read["source"] == "error"
+            tr.step("read", "TOOL", ok=not failed, **{"tool.name": action["tool"], "scram.url": read.get("url"), "scram.chars": read.get("chars"), "scram.source": read["source"]})
+            run["trace_spans"].append(_span("read", "error" if failed else "skipped" if read["source"] == "skipped" else "ok", action["tool"]))
+            if failed:
+                run["block_reasons"] = ["CONTROL_UNAVAILABLE"]
+            self._move(run, "BLOCKED" if failed else "COMPLETED")
             run["trace_spans"].append(_span("audit", "ok", "recorded"))
             self._finish(run)
             return self.view(run)

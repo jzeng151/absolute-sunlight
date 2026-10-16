@@ -44,12 +44,11 @@ def parse_with_model(text: str) -> dict[str, Any] | None:
 # ---------- Anchor Browser: the GREEN read-only action ----------
 
 
-def anchor_read(url: str | None = None) -> dict[str, Any]:
-    """Fetch a public page through Anchor Browser, read-only. Policy allows this under NC-01.
+def anchor_read(url: str) -> dict[str, Any]:
+    """Fetch the exact URL authorized by the caller under NC-01, read-only.
 
-    Returns {"source": "anchor"|"skipped", "url", "chars", "excerpt"}.
+    Returns {"source": "anchor"|"skipped"|"error", "url", "chars", "excerpt"}.
     """
-    url = url or config.ANCHOR_READ_URL
     if not config.ANCHOR_API_KEY:
         return {"source": "skipped", "url": url, "chars": 0, "excerpt": ""}
     try:

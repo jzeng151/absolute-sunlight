@@ -7,6 +7,7 @@ from __future__ import annotations
 import hashlib
 import json
 from typing import Any
+from urllib.parse import urlsplit
 
 from . import config
 
@@ -51,6 +52,14 @@ def decide(action: dict) -> tuple[str, str, str]:
         return "RED", "SAFETY_BYPASS_FORBIDDEN", "NC-05"
     if tool == "analyze_history" and action.get("intent") == "read":
         return "GREEN", "READ_ONLY_ALLOWED", "NC-01"
+    if tool == "anchor.fetch_webpage" and action.get("intent") == "read":
+        try:
+            url = urlsplit(action.get("target", ""))
+            if url.scheme == "https" and url.netloc == "www.nrc.gov":
+                return "GREEN", "READ_ONLY_ALLOWED", "NC-01"
+        except ValueError:
+            pass
+        return "RED", "NO_AUTHORITY", "NC-06"
     if tool == "adjust_output":
         target = post.get("output_percent")
         if not isinstance(target, (int, float)) or "delta_percent" not in params:
@@ -62,16 +71,17 @@ def decide(action: dict) -> tuple[str, str, str]:
 
 
 def typed_action_from_case(case: dict, run_id: str, actor_id: str, confidence: float = 1.0) -> dict:
+    target = case.get("target", REACTOR["target"])
     params = case["normalized_parameters"]
     post = case["expected_postcondition"]
     return {
         "run_id": run_id,
         "actor_id": actor_id,
         "tool": case["tool"],
-        "target": REACTOR["target"],
+        "target": target,
         "normalized_parameters": params,
         "intent": case["intent"],
         "expected_postcondition": post,
         "confidence": confidence,
-        "action_hash": action_hash(case["tool"], REACTOR["target"], params, post),
+        "action_hash": action_hash(case["tool"], target, params, post),
     }
