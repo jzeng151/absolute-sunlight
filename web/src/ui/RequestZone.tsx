@@ -1,3 +1,4 @@
+import { useState } from 'react';
 import casesFile from '../fixtures/cases.json';
 import { shortHash } from '../api/hash';
 import type { CaseId, RunView } from '../types';
@@ -10,9 +11,12 @@ interface Props {
   run: RunView | null;
   busy: boolean;
   onPick: (id: CaseId) => void;
+  onAsk: (text: string) => void;
 }
 
-export function RequestZone({ caseId, run, busy, onPick }: Props) {
+export function RequestZone({ caseId, run, busy, onPick, onAsk }: Props) {
+  const [draft, setDraft] = useState('');
+  const ask = draft.trim();
   const def = casesFile.cases.find((c) => c.id === caseId)!;
   const a = run?.action;
   const color = policyColor(run);
@@ -39,6 +43,32 @@ export function RequestZone({ caseId, run, busy, onPick }: Props) {
           ))}
         </div>
       </div>
+
+      <form
+        className="ask"
+        onSubmit={(e) => {
+          e.preventDefault();
+          if (ask && !busy) onAsk(ask);
+        }}
+      >
+        <label className="eyebrow" htmlFor="ask-text">Ask the assistant</label>
+        <textarea
+          id="ask-text"
+          className="ask__text"
+          rows={2}
+          maxLength={500}
+          value={draft}
+          placeholder="e.g. Raise output two percent"
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && !e.shiftKey) {
+              e.preventDefault();
+              if (ask && !busy) onAsk(ask);
+            }
+          }}
+        />
+        <button type="submit" className="btn" disabled={busy || !ask}>Send to assistant</button>
+      </form>
 
       <div>
         <h2 className="eyebrow">I · Operator request</h2>

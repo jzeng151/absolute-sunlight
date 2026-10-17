@@ -16,6 +16,7 @@ async function call<T>(method: 'GET' | 'POST', path: string, body?: unknown): Pr
 
 export const liveApi: ScramApi = {
   createRun: (caseId) => call<RunView>('POST', '/api/runs', { case_id: caseId }),
+  askRun: (text) => call<RunView>('POST', '/api/runs', { text }),
   approve: (run, actorId) =>
     call<RunView>('POST', `/api/runs/${run.run_id}/approve`, { actor_id: actorId, action_hash: run.action?.action_hash }),
   reject: (run) => call<RunView>('POST', `/api/runs/${run.run_id}/reject`),
