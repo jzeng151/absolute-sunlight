@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, model_validator
 from starlette.concurrency import run_in_threadpool
 
 from . import config, core
@@ -37,7 +37,15 @@ app.add_middleware(CORSMiddleware, allow_origins=config.CORS_ORIGINS, allow_meth
 
 
 class CreateRun(BaseModel):
-    case_id: str
+    """Either a prepared case or the operator's own words, never both."""
+    case_id: str | None = None
+    text: str | None = Field(None, max_length=500)
+
+    @model_validator(mode="after")
+    def _one_source(self):
+        if (self.case_id is None) == (self.text is None or not self.text.strip()):
+            raise ValueError("send exactly one of case_id or text")
+        return self
 
 
 class Approve(BaseModel):
@@ -71,6 +79,8 @@ def health():
 
 @app.post("/api/runs")
 def create_run(body: CreateRun):
+    if body.text is not None:
+        return _guard(_engine().create_text_run, body.text)
     return _guard(_engine().create_run, body.case_id)
 
 

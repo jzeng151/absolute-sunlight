@@ -274,6 +274,25 @@ export const fixtureApi: ScramApi = {
     return structuredClone(v);
   },
 
+  // Fixture mode has no model, so a typed request fails closed exactly as the API does without a key.
+  async askRun(text) {
+    await delay();
+    await advanceRuns();
+    const runId = `run_0${++counter}`;
+    const v = emptyView(runId, findCase('C2'));
+    v.scenario_id = 'OP';
+    v.request_text = text.trim();
+    v.machine_state = 'BLOCKED';
+    v.block_reasons = ['PARSE_UNCERTAIN'];
+    v.decision = {
+      run_id: runId, policy_version: findRule('NC-06').policy_version, rule_ids: [], state: 'RED',
+      reason_code: 'PARSE_UNCERTAIN', reversible: false, approval_required: false
+    };
+    v.trace_spans = [span('request', 'ok'), span('normalize', 'error', 'no model configured'), span('audit', 'ok', 'recorded')];
+    runs.set(runId, { base: v, startedAt: null, fault, beforeOutput: currentOutput });
+    return structuredClone(v);
+  },
+
   async approve(run, actorId) {
     await delay();
     await advanceRuns();

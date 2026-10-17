@@ -56,6 +56,7 @@ export default function App() {
     setRun(null);
   };
   const runCase = () => act(() => api.createRun(caseId));
+  const ask = (text: string) => act(() => api.askRun(text));
   const approve = () => run && act(() => api.approve(run, ACTOR));
   const reject = () => run && act(() => api.reject(run));
   const again = () => setRun(null);
@@ -91,11 +92,11 @@ export default function App() {
       )}
       {view === 'console' ? (
         <main className="zones">
-          <RequestZone caseId={caseId} run={run} busy={busy || running} onPick={pick} />
+          <RequestZone caseId={caseId} run={run} busy={busy || running} onPick={pick} onAsk={ask} />
           <ControlZone
             run={run}
             mode={mode}
-            caseLabel={`${caseLabel.id} ${caseLabel.label}`}
+            caseLabel={run?.scenario_id === 'OP' ? 'Operator request' : `${caseLabel.id} ${caseLabel.label}`}
             busy={busy}
             onRun={runCase}
             onApprove={approve}

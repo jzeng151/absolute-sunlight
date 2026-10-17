@@ -127,7 +127,8 @@ export interface Evaluator {
 /** The single object the screen renders. GET /api/runs/{id} returns this. */
 export interface RunView {
   run_id: string;
-  scenario_id: CaseId;
+  /** 'OP' when the operator typed the request instead of choosing a case. */
+  scenario_id: CaseId | 'OP';
   machine_state: MachineState;
   request_text: string;
   current_output_percent: number;

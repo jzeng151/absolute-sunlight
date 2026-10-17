@@ -27,6 +27,7 @@ from .adapters.store import make_store
 
 log = logging.getLogger("scram.engine")
 ACTOR = "operator_nw"
+OPERATOR_CASE = "OP"  # scenario id for a request the operator typed
 
 ALLOWED = {
     "CLASSIFIED": {"COMPLETED", "AWAITING_APPROVAL", "BLOCKED"},
@@ -232,11 +233,22 @@ class Engine:
         reading = others.parse_with_model(core.CASES[case_id]["request_text"])
         return self._create_run(case_id, reading)
 
+    def create_text_run(self, text: str) -> dict[str, Any]:
+        """The operator's own words. With no model configured the request fails closed."""
+        if self.closed:
+            raise ForbiddenTransition("engine is shutting down")
+        text = text.strip()
+        reading = others.parse_with_model(text)
+        return self._create_run(OPERATOR_CASE, {} if reading is None else reading, text)
+
     @accepting_work
-    def _create_run(self, case_id: str, reading) -> dict[str, Any]:
-        if case_id not in core.CASES:
+    def _create_run(self, case_id: str, reading, text: str | None = None) -> dict[str, Any]:
+        if text is not None:
+            case = {"request_text": text}
+        elif case_id in core.CASES:
+            case = core.CASES[case_id]
+        else:
             raise NotFound(case_id)
-        case = core.CASES[case_id]
         with self.lock:
             self.counter += 1
             run_id = f"run_{uuid4().hex}"
@@ -264,12 +276,12 @@ class Engine:
                 run["action"] = core.typed_action_from_case(browser_case, run_id, ACTOR, confidence)
         except ValueError:
             confidence = 0.0
-        model = config.GEMINI_MODEL if using_model else "prepared"
+        model = (config.GEMINI_MODEL if config.GEMINI_API_KEY else "none") if using_model else "prepared"
         tr.step("normalize", "LLM" if using_model else "CHAIN", ok=confidence >= config.PARSE_MIN_CONFIDENCE,
                 outcome="ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "failed",
                 evidence={"action": run["action"], "action_hash": run["action"]["action_hash"], "intent": run["action"]["intent"]} if run["action"] else {},
                 **{"input.value": case["request_text"], "output.value": str(reading if using_model else run["action"]), "scram.confidence": confidence, "llm.model_name": model})
-        run["trace_spans"].append(_span("normalize", "ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "error", "Gemini" if using_model else "prepared"))
+        run["trace_spans"].append(_span("normalize", "ok" if confidence >= config.PARSE_MIN_CONFIDENCE else "error", ("Gemini" if config.GEMINI_API_KEY else "no model configured") if using_model else "prepared"))
         if confidence < config.PARSE_MIN_CONFIDENCE:
             run["_final_state"] = "BLOCKED"
             run["block_reasons"] = ["PARSE_UNCERTAIN"]
